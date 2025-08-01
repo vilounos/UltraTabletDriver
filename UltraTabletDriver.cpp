@@ -20,6 +20,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winmm.lib")
 
+
 enum class RotationType {
     NONE = 0, // No rotation
     LEFT = 1, // 90° counter-clockwise
@@ -49,6 +50,21 @@ struct Monitor {
     bool isPrimary;
 };
 
+struct InterpolationSample {
+    int screenX, screenY;
+    std::chrono::high_resolution_clock::time_point timestamp;
+    bool valid;
+};
+
+static const int INTERPOLATION_BUFFER_SIZE = 8;
+InterpolationSample interpolationBuffer[INTERPOLATION_BUFFER_SIZE];
+std::atomic<int> interpolationWriteIndex{ 0 };
+std::atomic<int> interpolationReadIndex{ 0 };
+std::atomic<int> interpolationSampleCount{ 0 };
+
+bool interpolationEnabled = true;
+int interpolationMultiplier = 2;
+
 struct DriverConfig {
     int areaWidth = 28;
     int areaHeight = 22;
@@ -69,6 +85,7 @@ struct TabletData {
     bool isValid;
     std::chrono::high_resolution_clock::time_point timestamp;
 };
+
 
 class HighPerformanceTabletDriver {
 private:
@@ -96,6 +113,11 @@ private:
     std::atomic<double> currentVelocityX{ 0.0 };
     std::atomic<double> currentVelocityY{ 0.0 };
     std::atomic<double> predictionAmount{ 0.0 };
+    std::atomic<double> lastVelocityX{ 0.0 };
+    std::atomic<double> lastVelocityY{ 0.0 };
+    std::atomic<double> currentAccelerationX{ 0.0 };
+    std::atomic<double> currentAccelerationY{ 0.0 };
+    std::atomic<bool> hasLastVelocity{ false };
 
     // Position logging variables
     std::atomic<int> currentTabletX{ 0 };
@@ -166,6 +188,13 @@ public:
         dataBuffer[1] = {};
         dataBuffer[0].isValid = false;
         dataBuffer[1].isValid = false;
+
+        // Initialize acceleration tracking
+        hasLastVelocity.store(false);
+        lastVelocityX.store(0.0);
+        lastVelocityY.store(0.0);
+        currentAccelerationX.store(0.0);
+        currentAccelerationY.store(0.0);
     }
 
     ~HighPerformanceTabletDriver() {
@@ -245,6 +274,8 @@ public:
                     else if (key == "predictionStrength") config.predictionStrength = std::stoi(value);
                     else if (key == "clickEnabled") config.clickEnabled = (value == "1");
                     else if (key == "currentMonitor") config.currentMonitor = std::stoi(value);
+                    else if (key == "interpolationEnabled") interpolationEnabled = (value == "1");
+                    else if (key == "interpolationMultiplier") interpolationMultiplier = std::stoi(value);
                 }
             }
             file.close();
@@ -263,6 +294,8 @@ public:
             file << "predictionStrength = " << config.predictionStrength << std::endl;
             file << "clickEnabled = " << (config.clickEnabled ? 1 : 0) << std::endl;
             file << "currentMonitor = " << config.currentMonitor << std::endl;
+            file << "interpolationEnabled = " << (interpolationEnabled ? 1 : 0) << std::endl;
+            file << "interpolationMultiplier = " << interpolationMultiplier << std::endl;
             file.close();
         }
     }
@@ -294,7 +327,7 @@ public:
                 (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(requiredSize);
 
             if (deviceInterfaceDetailData == nullptr) {
-                continue; // Skip if memory allocation failed
+                continue;
             }
 
             deviceInterfaceDetailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
@@ -410,10 +443,14 @@ private:
         case LoggingMode::PREDICTION: {
             double velX = currentVelocityX.load();
             double velY = currentVelocityY.load();
+            double accelX = currentAccelerationX.load();
+            double accelY = currentAccelerationY.load();
             double predAmount = predictionAmount.load();
             double totalVelocity = sqrt(velX * velX + velY * velY);
-            std::cout << "Velocity: " << (int)totalVelocity << " px/frame | VelX: " << (int)velX
-                << " | VelY: " << (int)velY << " | Prediction: " << (int)predAmount << " px           ";
+            double totalAcceleration = sqrt(accelX * accelX + accelY * accelY);
+
+            std::cout << "Vel: " << (int)totalVelocity << " px/f | Accel: " << (int)totalAcceleration
+                << " px/f² | Pred: " << (int)predAmount << " px                    ";
             break;
         }
         case LoggingMode::POSITION: {
@@ -537,6 +574,12 @@ public:
         }
         std::cout << std::endl;
 
+        std::cout << "Movement Interpolation: " << (interpolationEnabled ? "ON" : "OFF");
+        if (interpolationEnabled) {
+            std::cout << " (Multiplier: " << interpolationMultiplier << "x)";
+        }
+        std::cout << std::endl;
+
         std::cout << "Click Simulation: " << (config.clickEnabled ? "ON" : "OFF") << std::endl;
 
         std::cout << "Logging Mode: ";
@@ -554,20 +597,6 @@ public:
             const_cast<HighPerformanceTabletDriver*>(this)->loggingLinePos = csbi.dwCursorPosition;
         }
 
-        if (currentLoggingMode != LoggingMode::OFF) {
-            switch (currentLoggingMode) {
-            case LoggingMode::FREQUENCY:
-                std::cout << "Tablet: 0 Hz | Program: 0 Hz | Cursor: 0 Hz" << std::endl;
-                break;
-            case LoggingMode::PREDICTION:
-                std::cout << "Velocity: 0 px/frame | VelX: 0 | VelY: 0 | Prediction: 0 px" << std::endl;
-                break;
-            case LoggingMode::POSITION:
-                std::cout << "Tablet: (0,0) | Screen: (0,0) | Click: NO" << std::endl;
-                break;
-            }
-        }
-
         std::cout << std::endl;
         std::cout << "Controls:" << std::endl;
         std::cout << "Arrow keys: Move area center" << std::endl;
@@ -576,6 +605,8 @@ public:
         std::cout << "P: Toggle movement prediction" << std::endl;
         std::cout << "C: Toggle click simulation" << std::endl;
         std::cout << "+/-: Adjust prediction strength" << std::endl;
+        std::cout << "I: Toggle interpolation" << std::endl;
+        std::cout << "[/]: Adjust interpolation multiplier" << std::endl;
         if (monitors.size() > 1) {
             std::cout << "M: Switch monitor" << std::endl;
         }
@@ -758,6 +789,19 @@ public:
                                 ShowCurrentSettings();
                             }
                             break;
+                        case 'i':
+                        case 'I': // Toggle interpolation
+                            ToggleInterpolation();
+                            ShowCurrentSettings();
+                            break;
+                        case '[': // Decrease interpolation multiplier
+                            AdjustInterpolationMultiplier(-1);
+                            ShowCurrentSettings();
+                            break;
+                        case ']': // Increase interpolation multiplier
+                            AdjustInterpolationMultiplier(1);
+                            ShowCurrentSettings();
+                            break;
                         }
                     }
                 }
@@ -777,10 +821,17 @@ public:
         wasInProximityLast = false;
         lastTouchState = false;
         currentlyPressed = false;
-        
+
         hasValidData = false;
         lastValidRawX = -1;
         lastValidRawY = -1;
+
+        // Reset acceleration tracking
+        hasLastVelocity.store(false);
+        lastVelocityX.store(0.0);
+        lastVelocityY.store(0.0);
+        currentAccelerationX.store(0.0);
+        currentAccelerationY.store(0.0);
 
         // Clear frequency data
         {
@@ -792,6 +843,9 @@ public:
             programFrequency = 0.0;
             cursorUpdateFrequency = 0.0;
         }
+
+        // Clear interpolation buffer
+        ClearInterpolationBuffer();
 
         // Start safe priority threads
         inputThread = std::thread(&HighPerformanceTabletDriver::SafeInputLoop, this);
@@ -828,7 +882,6 @@ public:
     }
 
 private:
-    // SAFE INPUT LOOP
     void SafeInputLoop() {
         SetThreadSafePriority();
 
@@ -849,29 +902,268 @@ private:
         }
     }
 
-    // SAFE PROCESSING LOOP
     void SafeProcessingLoop() {
         SetThreadSafePriority();
 
         TabletData* lastProcessedData = nullptr;
-        auto lastUpdate = std::chrono::high_resolution_clock::now();
+        auto lastProcessTime = std::chrono::high_resolution_clock::now();
 
         while (running && !emergencyShutdown) {
             try {
                 TabletData* currentData = latestData.load();
+                auto currentTime = std::chrono::high_resolution_clock::now();
 
                 UpdateProgramFrequency();
 
                 if (currentData != nullptr && currentData != lastProcessedData && currentData->isValid) {
-                    ProcessTabletMovement(*currentData);
+
+                    int baseScreenX, baseScreenY;
+                    if (!CalculateScreenPosition(*currentData, baseScreenX, baseScreenY)) {
+                        lastProcessedData = currentData;
+                        continue;
+                    }
+
+                    int finalScreenX, finalScreenY;
+                    ApplyPrediction(baseScreenX, baseScreenY, finalScreenX, finalScreenY, currentData->timestamp);
+
+                    if (interpolationEnabled && interpolationSampleCount.load() >= 2) {
+                        StoreInterpolationSample(finalScreenX, finalScreenY, currentData->timestamp);
+
+                        auto interpolatedPositions = GenerateInterpolatedPositions();
+
+                        for (size_t i = 0; i < interpolatedPositions.size(); i++) {
+                            int interpX = interpolatedPositions[i].first;
+                            int interpY = interpolatedPositions[i].second;
+
+                            MoveCursorToPosition(interpX, interpY);
+
+                            if (i < interpolatedPositions.size() - 1) {
+                                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                            }
+                        }
+                    }
+                    else {
+                        if (interpolationEnabled) {
+                            StoreInterpolationSample(finalScreenX, finalScreenY, currentData->timestamp);
+                        }
+
+                        MoveCursorToPosition(finalScreenX, finalScreenY);
+                    }
+
+                    // Handle clicking
+                    HandleMouseClick(currentData->isTouching);
+
                     lastProcessedData = currentData;
+                    lastProcessTime = currentTime;
                 }
             }
             catch (...) {
-                // Emergency shutdown on any exception
                 emergencyShutdown = true;
                 break;
             }
+        }
+    }
+
+    bool CalculateScreenPosition(const TabletData& data, int& screenX, int& screenY) {
+        // Check if pen was just lifted
+        bool wasJustLifted = wasInProximityLast.load() && !data.inProximity;
+        wasInProximityLast.store(data.inProximity);
+
+        if (!data.inProximity && !data.isTouching) {
+            hasLastPosition = false;
+            return false;
+        }
+
+        // Calculate current area bounds
+        int areaLeft, areaRight, areaTop, areaBottom;
+        CalculateAreaBounds(areaLeft, areaRight, areaTop, areaBottom);
+
+        // Get current monitor
+        const Monitor& currentMonitor = monitors[config.currentMonitor];
+
+        // Store tablet position for logging
+        currentTabletX.store(data.rawX);
+        currentTabletY.store(data.rawY);
+        isCurrentlyClicking.store(data.isTouching);
+
+        // Check if point is within mapping area
+        if (data.rawX < areaLeft || data.rawX > areaRight || data.rawY < areaTop || data.rawY > areaBottom) {
+            MoveToNearestEdge(data.rawX, data.rawY, areaLeft, areaRight, areaTop, areaBottom, currentMonitor);
+
+            if (config.clickEnabled && currentlyPressed) {
+                HandleMouseClick(false);
+            }
+            hasLastPosition = false;
+            return false;
+        }
+
+        // Normalize coordinates
+        double normalizedX = (double)(data.rawX - areaLeft) / (areaRight - areaLeft);
+        double normalizedY = (double)(data.rawY - areaTop) / (areaBottom - areaTop);
+
+        // Apply rotation
+        double rotatedNormX, rotatedNormY;
+        ApplyRotation(normalizedX, normalizedY, rotatedNormX, rotatedNormY);
+
+        // Map to screen coordinates
+        screenX = currentMonitor.x + (int)(rotatedNormX * currentMonitor.width);
+        screenY = currentMonitor.y + (int)(rotatedNormY * currentMonitor.height);
+
+        return true;
+    }
+
+    void ApplyPrediction(int baseScreenX, int baseScreenY, int& finalScreenX, int& finalScreenY,
+        std::chrono::high_resolution_clock::time_point timestamp) {
+
+        finalScreenX = baseScreenX;
+        finalScreenY = baseScreenY;
+
+        // Check if pen was just lifted
+        bool wasJustLifted = wasInProximityLast.load() && !hasLastPosition.load();
+
+        if (config.movementPrediction && hasLastPosition && !wasJustLifted) {
+            // Calculate current velocity
+            double velocityX = baseScreenX - lastScreenX.load();
+            double velocityY = baseScreenY - lastScreenY.load();
+
+            // Store velocity for logging
+            currentVelocityX.store(velocityX);
+            currentVelocityY.store(velocityY);
+
+            // Calculate acceleration if we have previous velocity
+            double accelerationX = 0.0;
+            double accelerationY = 0.0;
+
+            if (hasLastVelocity.load()) {
+                accelerationX = velocityX - lastVelocityX.load();
+                accelerationY = velocityY - lastVelocityY.load();
+            }
+
+            // Store acceleration for logging
+            currentAccelerationX.store(accelerationX);
+            currentAccelerationY.store(accelerationY);
+
+            // Apply acceleration-based prediction
+            // Používáme kinematickou rovnici: s = v*t + 0.5*a*t²
+            // Pro prediction používáme t = predictionStrength jako časový faktor
+            double predictionTime = config.predictionStrength * 0.1; // Upravitelný časový faktor
+
+            // Predicted position based on current velocity and acceleration
+            double predX = velocityX * predictionTime + 0.5 * accelerationX * predictionTime * predictionTime;
+            double predY = velocityY * predictionTime + 0.5 * accelerationY * predictionTime * predictionTime;
+
+            // Omezit maximální prediction distance pro stabilitu
+            double maxPredictionDistance = 50.0; // pixely
+            double predictionDistance = sqrt(predX * predX + predY * predY);
+
+            if (predictionDistance > maxPredictionDistance) {
+                double scale = maxPredictionDistance / predictionDistance;
+                predX *= scale;
+                predY *= scale;
+            }
+
+            finalScreenX += (int)predX;
+            finalScreenY += (int)predY;
+
+            // Store prediction amount for logging
+            predictionAmount.store(sqrt(predX * predX + predY * predY));
+
+            // Update last velocity for next iteration
+            lastVelocityX.store(velocityX);
+            lastVelocityY.store(velocityY);
+            hasLastVelocity.store(true);
+        }
+        else {
+            // Reset prediction data when not predicting
+            currentVelocityX.store(0.0);
+            currentVelocityY.store(0.0);
+            currentAccelerationX.store(0.0);
+            currentAccelerationY.store(0.0);
+            predictionAmount.store(0.0);
+
+            // Reset velocity tracking when pen is lifted or prediction is disabled
+            if (wasJustLifted || !config.movementPrediction) {
+                hasLastVelocity.store(false);
+                lastVelocityX.store(0.0);
+                lastVelocityY.store(0.0);
+            }
+        }
+
+        // Get current monitor
+        const Monitor& currentMonitor = monitors[config.currentMonitor];
+
+        // Clamp to current monitor bounds
+        int safeMargin = 5;
+        finalScreenX = max(currentMonitor.x + safeMargin,
+            min(currentMonitor.x + currentMonitor.width - safeMargin, finalScreenX));
+        finalScreenY = max(currentMonitor.y + safeMargin,
+            min(currentMonitor.y + currentMonitor.height - safeMargin, finalScreenY));
+
+        lastScreenX.store(baseScreenX);
+        lastScreenY.store(baseScreenY);
+        hasLastPosition = true;
+    }
+
+    void MoveCursorToPosition(int screenX, int screenY) {
+        // Get current monitor for bounds checking
+        const Monitor& currentMonitor = monitors[config.currentMonitor];
+
+        // Skip invalid positions
+        if ((screenX <= currentMonitor.x + 10 && screenY <= currentMonitor.y + 10) ||
+            (screenX >= currentMonitor.x + currentMonitor.width - 10 &&
+                screenY <= currentMonitor.y + 10)) {
+            return;
+        }
+
+        try {
+            // Get current cursor position
+            POINT currentPos;
+            GetCursorPos(&currentPos);
+
+            // Calculate relative movement
+            int deltaX = screenX - currentPos.x;
+            int deltaY = screenY - currentPos.y;
+
+            // Send relative mouse movement
+            INPUT input = {};
+            input.type = INPUT_MOUSE;
+            input.mi.dwFlags = MOUSEEVENTF_MOVE;
+            input.mi.dx = deltaX;
+            input.mi.dy = deltaY;
+            SendInput(1, &input, sizeof(INPUT));
+
+            UpdateCursorFrequency();
+
+            currentScreenX.store(screenX);
+            currentScreenY.store(screenY);
+        }
+        catch (...) {
+            // Ignore cursor positioning errors
+        }
+    }
+
+    void ToggleInterpolation() {
+        interpolationEnabled = !interpolationEnabled;
+
+        if (!interpolationEnabled) {
+            ClearInterpolationBuffer();
+        }
+
+        SaveConfig();
+    }
+
+    void AdjustInterpolationMultiplier(int delta) {
+        interpolationMultiplier = max(1, min(4, interpolationMultiplier + delta));
+        SaveConfig();
+    }
+
+    void ClearInterpolationBuffer() {
+        interpolationWriteIndex.store(0);
+        interpolationReadIndex.store(0);
+        interpolationSampleCount.store(0);
+
+        for (int i = 0; i < INTERPOLATION_BUFFER_SIZE; i++) {
+            interpolationBuffer[i].valid = false;
         }
     }
 
@@ -920,7 +1212,6 @@ private:
             }
         }
         catch (...) {
-            // Skip this data packet on parsing error
             return;
         }
 
@@ -939,6 +1230,67 @@ private:
         }
     }
 
+    void StoreInterpolationSample(int screenX, int screenY, std::chrono::high_resolution_clock::time_point timestamp) {
+        int writeIdx = interpolationWriteIndex.load();
+
+        interpolationBuffer[writeIdx].screenX = screenX;
+        interpolationBuffer[writeIdx].screenY = screenY;
+        interpolationBuffer[writeIdx].timestamp = timestamp;
+        interpolationBuffer[writeIdx].valid = true;
+
+        interpolationWriteIndex.store((writeIdx + 1) % INTERPOLATION_BUFFER_SIZE);
+
+        int currentCount = interpolationSampleCount.load();
+        if (currentCount < INTERPOLATION_BUFFER_SIZE) {
+            interpolationSampleCount.store(currentCount + 1);
+        }
+        else {
+            interpolationReadIndex.store((interpolationReadIndex.load() + 1) % INTERPOLATION_BUFFER_SIZE);
+        }
+    }
+
+    std::vector<std::pair<int, int>> GenerateInterpolatedPositions() {
+        std::vector<std::pair<int, int>> positions;
+
+        int sampleCount = interpolationSampleCount.load();
+        if (sampleCount < 2) {
+            return positions;
+        }
+
+        std::vector<InterpolationSample> samples;
+        int readIdx = interpolationReadIndex.load();
+
+        for (int i = 0; i < min(sampleCount, 4); i++) {
+            int idx = (readIdx + sampleCount - 1 - i) % INTERPOLATION_BUFFER_SIZE;
+            if (interpolationBuffer[idx].valid) {
+                samples.insert(samples.begin(), interpolationBuffer[idx]);
+            }
+        }
+
+        if (samples.size() < 2) return positions;
+
+        const auto& prev = samples[samples.size() - 2];
+        const auto& current = samples[samples.size() - 1];
+
+        auto timeDiff = std::chrono::duration_cast<std::chrono::microseconds>(
+            current.timestamp - prev.timestamp).count();
+
+        if (timeDiff <= 0) return positions;
+
+        for (int i = 1; i <= interpolationMultiplier; i++) {
+            float t = (float)i / (interpolationMultiplier + 1);
+
+            int interpX = prev.screenX + (int)((current.screenX - prev.screenX) * t);
+            int interpY = prev.screenY + (int)((current.screenY - prev.screenY) * t);
+
+            positions.push_back({ interpX, interpY });
+        }
+
+        positions.push_back({ current.screenX, current.screenY });
+
+        return positions;
+    }
+
     bool IsValidTabletData(int rawX, int rawY, bool inProximity) {
         if (rawX < 0 || rawY < 0 || rawX > currentTablet.maxX || rawY > currentTablet.maxY) {
             return false;
@@ -955,7 +1307,7 @@ private:
         if (hasValidData.load()) {
             int lastX = lastValidRawX.load();
             int lastY = lastValidRawY.load();
-            
+
             if (lastX >= 0 && lastY >= 0) {
                 int deltaX = abs(rawX - lastX);
                 int deltaY = abs(rawY - lastY);
@@ -974,120 +1326,6 @@ private:
         hasValidData.store(true);
 
         return true;
-    }
-
-    void ProcessTabletMovement(const TabletData& data) {
-        if (!data.isValid) {
-            return;
-        }
-
-        // Check if pen was just lifted
-        bool wasJustLifted = wasInProximityLast.load() && !data.inProximity;
-        wasInProximityLast.store(data.inProximity);
-
-        if (!data.inProximity && !data.isTouching) {
-            hasLastPosition = false;
-            return;
-        }
-
-        // Calculate current area bounds
-        int areaLeft, areaRight, areaTop, areaBottom;
-        CalculateAreaBounds(areaLeft, areaRight, areaTop, areaBottom);
-
-        // Get current monitor
-        const Monitor& currentMonitor = monitors[config.currentMonitor];
-
-        // Store tablet position for logging
-        currentTabletX.store(data.rawX);
-        currentTabletY.store(data.rawY);
-        isCurrentlyClicking.store(data.isTouching);
-
-        // Check if point is within mapping area
-        if (data.rawX < areaLeft || data.rawX > areaRight || data.rawY < areaTop || data.rawY > areaBottom) {
-            MoveToNearestEdge(data.rawX, data.rawY, areaLeft, areaRight, areaTop, areaBottom, currentMonitor);
-
-            if (config.clickEnabled && currentlyPressed) {
-                HandleMouseClick(false);
-            }
-            hasLastPosition = false;
-            return;
-        }
-
-        HandleMouseClick(data.isTouching);
-
-        // Normalize coordinates
-        double normalizedX = (double)(data.rawX - areaLeft) / (areaRight - areaLeft);
-        double normalizedY = (double)(data.rawY - areaTop) / (areaBottom - areaTop);
-
-        // Apply rotation
-        double rotatedNormX, rotatedNormY;
-        ApplyRotation(normalizedX, normalizedY, rotatedNormX, rotatedNormY);
-
-        // Map to screen coordinates
-        int baseScreenX = currentMonitor.x + (int)(rotatedNormX * currentMonitor.width);
-        int baseScreenY = currentMonitor.y + (int)(rotatedNormY * currentMonitor.height);
-
-        // Calculate final position with prediction
-        int finalScreenX = baseScreenX;
-        int finalScreenY = baseScreenY;
-
-        if (config.movementPrediction && hasLastPosition && !wasJustLifted) {
-            // Calculate movement vector
-            double velocityX = baseScreenX - lastScreenX.load();
-            double velocityY = baseScreenY - lastScreenY.load();
-
-            // Store velocity for logging
-            currentVelocityX.store(velocityX);
-            currentVelocityY.store(velocityY);
-
-            // Apply prediction with safer limits
-            double predictionFactor = min(config.predictionStrength * 0.15, 3.0);
-            double predX = velocityX * predictionFactor;
-            double predY = velocityY * predictionFactor;
-
-            finalScreenX += (int)predX;
-            finalScreenY += (int)predY;
-
-            // Store prediction amount for logging
-            predictionAmount.store(sqrt(predX * predX + predY * predY));
-        }
-        else {
-            // Reset prediction logging when not predicting
-            currentVelocityX.store(0.0);
-            currentVelocityY.store(0.0);
-            predictionAmount.store(0.0);
-        }
-
-        // Clamp to current monitor bounds with safety margin
-        int safeMargin = 5;
-        finalScreenX = max(currentMonitor.x + safeMargin,
-            min(currentMonitor.x + currentMonitor.width - safeMargin, finalScreenX));
-        finalScreenY = max(currentMonitor.y + safeMargin,
-            min(currentMonitor.y + currentMonitor.height - safeMargin, finalScreenY));
-
-        if ((finalScreenX <= currentMonitor.x + 10 && finalScreenY <= currentMonitor.y + 10) ||
-            (finalScreenX >= currentMonitor.x + currentMonitor.width - 10 &&
-                finalScreenY <= currentMonitor.y + 10)) {
-            return;
-        }
-
-        // Use safer cursor positioning
-        try {
-            SetCursorPos(finalScreenX, finalScreenY);
-            UpdateCursorFrequency(); // Track cursor update frequency
-
-            // Store screen position for logging
-            currentScreenX.store(finalScreenX);
-            currentScreenY.store(finalScreenY);
-        }
-        catch (...) {
-            // Ignore cursor positioning errors
-        }
-
-        // Store current unpredicted screen position
-        lastScreenX.store(baseScreenX);
-        lastScreenY.store(baseScreenY);
-        hasLastPosition = true;
     }
 
     void MoveToNearestEdge(int rawX, int rawY, int areaLeft, int areaRight, int areaTop, int areaBottom, const Monitor& currentMonitor) {
@@ -1112,7 +1350,21 @@ private:
         screenY = max(currentMonitor.y, min(currentMonitor.y + currentMonitor.height - 1, screenY));
 
         try {
-            SetCursorPos(screenX, screenY);
+            // Get current cursor position
+            POINT currentPos;
+            GetCursorPos(&currentPos);
+
+            // Calculate relative movement
+            int deltaX = screenX - currentPos.x;
+            int deltaY = screenY - currentPos.y;
+
+            // Send relative mouse movement
+            INPUT input = {};
+            input.type = INPUT_MOUSE;
+            input.mi.dwFlags = MOUSEEVENTF_MOVE;
+            input.mi.dx = deltaX;
+            input.mi.dy = deltaY;
+            SendInput(1, &input, sizeof(INPUT));
         }
         catch (...) {
             // Ignore cursor positioning errors
