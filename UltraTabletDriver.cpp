@@ -534,7 +534,7 @@ private:
 public:
     void ShowCurrentSettings() const {
         system("cls");
-        std::cout << "=== Ultra Tablet Driver v2.1 - by vilounos (stable) ===" << std::endl;
+        std::cout << "=== Ultra Tablet Driver v3.0 - by vilounos (stable) ===" << std::endl;
         std::cout << "Detected Tablet: " << currentTablet.name << std::endl;
 
         // Show monitor information
@@ -1542,7 +1542,7 @@ public:
 };
 
 int main() {
-    std::cout << "Ultra Tablet Driver v2.1 - by vilounos (stable)" << std::endl;
+    std::cout << "Ultra Tablet Driver v3.0 - by vilounos (stable)" << std::endl;
     std::cout << "Optimized for stability and safe high performance" << std::endl;
     std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G640" << std::endl << std::endl;
 
