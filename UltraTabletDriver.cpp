@@ -12,6 +12,8 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
@@ -41,6 +43,12 @@ struct TabletSpec {
     std::string name;
 };
 
+struct Monitor {
+    int x, y, width, height;
+    std::string name;
+    bool isPrimary;
+};
+
 struct DriverConfig {
     int areaWidth = 28;
     int areaHeight = 22;
@@ -50,6 +58,7 @@ struct DriverConfig {
     bool movementPrediction = false;
     int predictionStrength = 2;
     bool clickEnabled = false;
+    int currentMonitor = 0;
 };
 
 struct TabletData {
@@ -57,6 +66,7 @@ struct TabletData {
     int rawY;
     bool inProximity;
     bool isTouching;
+    bool isValid;
     std::chrono::high_resolution_clock::time_point timestamp;
 };
 
@@ -65,13 +75,34 @@ private:
     // High-performance timing variables
     std::atomic<double> tabletFrequency{ 0.0 };
     std::atomic<double> programFrequency{ 0.0 };
+    std::atomic<double> cursorUpdateFrequency{ 0.0 };
     std::deque<std::chrono::high_resolution_clock::time_point> tabletUpdateTimes;
     std::deque<std::chrono::high_resolution_clock::time_point> programUpdateTimes;
+    std::deque<std::chrono::high_resolution_clock::time_point> cursorUpdateTimes;
     std::mutex frequencyMutex;
 
-    bool enableFrequencyLogging = false;
+    enum class LoggingMode {
+        OFF = 0,
+        FREQUENCY = 1,
+        PREDICTION = 2,
+        POSITION = 3
+    };
+
+    LoggingMode currentLoggingMode = LoggingMode::OFF;
     HANDLE consoleHandle;
-    COORD frequencyLinePos;
+    COORD loggingLinePos;
+
+    // Prediction logging variables
+    std::atomic<double> currentVelocityX{ 0.0 };
+    std::atomic<double> currentVelocityY{ 0.0 };
+    std::atomic<double> predictionAmount{ 0.0 };
+
+    // Position logging variables
+    std::atomic<int> currentTabletX{ 0 };
+    std::atomic<int> currentTabletY{ 0 };
+    std::atomic<int> currentScreenX{ 0 };
+    std::atomic<int> currentScreenY{ 0 };
+    std::atomic<bool> isCurrentlyClicking{ false };
 
     // Threading and performance
     HANDLE deviceHandle;
@@ -80,28 +111,37 @@ private:
     TabletSpec currentTablet;
     DriverConfig config;
 
-    // High-priority threads
+    // Safe priority threads
     std::thread inputThread;
     std::thread processingThread;
     std::thread configThread;
-    std::thread frequencyThread;
+    std::thread loggingThread;
 
     // Lock-free data exchange
     std::atomic<TabletData*> latestData{ nullptr };
     TabletData dataBuffer[2];  // Double buffering
     std::atomic<int> currentBuffer{ 0 };
 
-    // Screen resolution
+    // Multi-monitor support
+    std::vector<Monitor> monitors;
     int SCREEN_WIDTH = GetSystemMetrics(SM_CXSCREEN);
     int SCREEN_HEIGHT = GetSystemMetrics(SM_CYSCREEN);
 
     // Movement prediction variables
     std::atomic<int> lastScreenX{ 0 }, lastScreenY{ 0 };
     std::atomic<bool> hasLastPosition{ false };
+    std::atomic<bool> wasInProximityLast{ false };
 
     // Click state tracking
     std::atomic<bool> lastTouchState{ false };
     std::atomic<bool> currentlyPressed{ false };
+
+    // Safety shutdown flag
+    std::atomic<bool> emergencyShutdown{ false };
+
+    std::atomic<int> lastValidRawX{ -1 };
+    std::atomic<int> lastValidRawY{ -1 };
+    std::atomic<bool> hasValidData{ false };
 
     // Tablet specifications
     const TabletSpec TABLET_SPECS[4] = {
@@ -114,19 +154,78 @@ private:
 public:
     HighPerformanceTabletDriver() : deviceHandle(INVALID_HANDLE_VALUE) {
         currentTablet = TABLET_SPECS[0]; // Unknown by default
+        DetectMonitors();
         LoadConfig();
 
-        // Get console handle for frequency display
+        // Get console handle for logging display
         consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
-        frequencyLinePos = { 0, 0 };
+        loggingLinePos = { 0, 0 };
 
         // Initialize data buffers
         dataBuffer[0] = {};
         dataBuffer[1] = {};
+        dataBuffer[0].isValid = false;
+        dataBuffer[1].isValid = false;
     }
 
     ~HighPerformanceTabletDriver() {
         Stop();
+        // Ensure all threads are properly cleaned up
+        if (deviceHandle != INVALID_HANDLE_VALUE) {
+            CloseHandle(deviceHandle);
+            deviceHandle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
+        std::vector<Monitor>* monitors = reinterpret_cast<std::vector<Monitor>*>(dwData);
+
+        MONITORINFOEX monitorInfo;
+        monitorInfo.cbSize = sizeof(MONITORINFOEX);
+
+        if (GetMonitorInfo(hMonitor, &monitorInfo)) {
+            Monitor monitor;
+            monitor.x = monitorInfo.rcMonitor.left;
+            monitor.y = monitorInfo.rcMonitor.top;
+            monitor.width = monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left;
+            monitor.height = monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top;
+            char deviceName[64];
+            WideCharToMultiByte(CP_UTF8, 0, monitorInfo.szDevice, -1, deviceName, sizeof(deviceName), NULL, NULL);
+            monitor.name = std::string(deviceName);
+            monitor.isPrimary = (monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0;
+
+            monitors->push_back(monitor);
+        }
+
+        return TRUE;
+    }
+
+    void DetectMonitors() {
+        monitors.clear();
+        EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
+
+        // Sort monitors: primary first, then by position
+        std::sort(monitors.begin(), monitors.end(), [](const Monitor& a, const Monitor& b) {
+            if (a.isPrimary != b.isPrimary) return a.isPrimary;
+            return a.x < b.x;
+            });
+
+        if (monitors.empty()) {
+            // Fallback to single monitor
+            Monitor fallback;
+            fallback.x = 0;
+            fallback.y = 0;
+            fallback.width = SCREEN_WIDTH;
+            fallback.height = SCREEN_HEIGHT;
+            fallback.name = "Primary";
+            fallback.isPrimary = true;
+            monitors.push_back(fallback);
+        }
+
+        // Ensure current monitor is valid
+        if (config.currentMonitor >= (int)monitors.size()) {
+            config.currentMonitor = 0;
+        }
     }
 
     void LoadConfig() {
@@ -145,6 +244,7 @@ public:
                     else if (key == "movementPrediction") config.movementPrediction = (value == "1");
                     else if (key == "predictionStrength") config.predictionStrength = std::stoi(value);
                     else if (key == "clickEnabled") config.clickEnabled = (value == "1");
+                    else if (key == "currentMonitor") config.currentMonitor = std::stoi(value);
                 }
             }
             file.close();
@@ -162,6 +262,7 @@ public:
             file << "movementPrediction = " << (config.movementPrediction ? 1 : 0) << std::endl;
             file << "predictionStrength = " << config.predictionStrength << std::endl;
             file << "clickEnabled = " << (config.clickEnabled ? 1 : 0) << std::endl;
+            file << "currentMonitor = " << config.currentMonitor << std::endl;
             file.close();
         }
     }
@@ -191,6 +292,11 @@ public:
 
             PSP_DEVICE_INTERFACE_DETAIL_DATA deviceInterfaceDetailData =
                 (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(requiredSize);
+
+            if (deviceInterfaceDetailData == nullptr) {
+                continue; // Skip if memory allocation failed
+            }
+
             deviceInterfaceDetailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
 
             if (SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData,
@@ -238,10 +344,8 @@ public:
     }
 
 private:
-    void SetThreadHighPriority() {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-        HANDLE currentProcess = GetCurrentProcess();
-        SetPriorityClass(currentProcess, REALTIME_PRIORITY_CLASS);
+    void SetThreadSafePriority() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     }
 
     void UpdateTabletFrequency() {
@@ -254,7 +358,7 @@ private:
         while (!tabletUpdateTimes.empty() && tabletUpdateTimes.front() < oneSecondAgo) {
             tabletUpdateTimes.pop_front();
         }
-        tabletFrequency.store(tabletUpdateTimes.size());
+        tabletFrequency.store(static_cast<double>(tabletUpdateTimes.size()));
     }
 
     void UpdateProgramFrequency() {
@@ -267,24 +371,62 @@ private:
         while (!programUpdateTimes.empty() && programUpdateTimes.front() < oneSecondAgo) {
             programUpdateTimes.pop_front();
         }
-        programFrequency.store(programUpdateTimes.size());
+        programFrequency.store(static_cast<double>(programUpdateTimes.size()));
     }
 
-    void UpdateFrequencyDisplay() {
-        if (!enableFrequencyLogging || !running) return;
+    void UpdateCursorFrequency() {
+        auto currentTime = std::chrono::high_resolution_clock::now();
+
+        std::lock_guard<std::mutex> lock(frequencyMutex);
+
+        cursorUpdateTimes.push_back(currentTime);
+        auto oneSecondAgo = currentTime - std::chrono::seconds(1);
+        while (!cursorUpdateTimes.empty() && cursorUpdateTimes.front() < oneSecondAgo) {
+            cursorUpdateTimes.pop_front();
+        }
+        cursorUpdateFrequency.store(static_cast<double>(cursorUpdateTimes.size()));
+    }
+
+    void UpdateLoggingDisplay() {
+        if (currentLoggingMode == LoggingMode::OFF || !running) return;
 
         // Save current cursor position
         CONSOLE_SCREEN_BUFFER_INFO csbi;
-        GetConsoleScreenBufferInfo(consoleHandle, &csbi);
+        if (!GetConsoleScreenBufferInfo(consoleHandle, &csbi)) return;
         COORD savedPos = csbi.dwCursorPosition;
 
-        // Update frequency
-        SetConsoleCursorPosition(consoleHandle, frequencyLinePos);
-        double tFreq = tabletFrequency.load();
-        double pFreq = programFrequency.load();
+        // Update display based on current mode
+        SetConsoleCursorPosition(consoleHandle, loggingLinePos);
 
-        std::cout << "Tablet: " << (int)tFreq << " Hz | Program: "
-            << (int)pFreq << " Hz                                                                                    ";
+        switch (currentLoggingMode) {
+        case LoggingMode::FREQUENCY: {
+            double tFreq = tabletFrequency.load();
+            double pFreq = programFrequency.load();
+            double cFreq = cursorUpdateFrequency.load();
+            std::cout << "Tablet: " << (int)tFreq << " Hz | Program: " << (int)pFreq
+                << " Hz | Cursor: " << (int)cFreq << " Hz                                           ";
+            break;
+        }
+        case LoggingMode::PREDICTION: {
+            double velX = currentVelocityX.load();
+            double velY = currentVelocityY.load();
+            double predAmount = predictionAmount.load();
+            double totalVelocity = sqrt(velX * velX + velY * velY);
+            std::cout << "Velocity: " << (int)totalVelocity << " px/frame | VelX: " << (int)velX
+                << " | VelY: " << (int)velY << " | Prediction: " << (int)predAmount << " px           ";
+            break;
+        }
+        case LoggingMode::POSITION: {
+            int tabX = currentTabletX.load();
+            int tabY = currentTabletY.load();
+            int scrX = currentScreenX.load();
+            int scrY = currentScreenY.load();
+            bool clicking = isCurrentlyClicking.load();
+            std::cout << "Tablet: (" << tabX << "," << tabY << ") | Screen: (" << scrX << "," << scrY
+                << ") | Click: " << (clicking ? "YES" : "NO") << "               ";
+            break;
+        }
+        }
 
         // Restore cursor position
         SetConsoleCursorPosition(consoleHandle, savedPos);
@@ -355,9 +497,19 @@ private:
 public:
     void ShowCurrentSettings() const {
         system("cls");
-        std::cout << "=== Ultra Tablet Driver v2.0 - by vilounos ===" << std::endl;
+        std::cout << "=== Ultra Tablet Driver v2.1 - by vilounos (stable) ===" << std::endl;
         std::cout << "Detected Tablet: " << currentTablet.name << std::endl;
-        std::cout << "Monitor Resolution: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT << std::endl;
+
+        // Show monitor information
+        if (monitors.size() > 1) {
+            std::cout << "Current Monitor: " << (config.currentMonitor + 1) << "/" << monitors.size()
+                << " (" << monitors[config.currentMonitor].name << ") - "
+                << monitors[config.currentMonitor].width << "x" << monitors[config.currentMonitor].height << std::endl;
+        }
+        else {
+            std::cout << "Monitor Resolution: " << monitors[0].width << "x" << monitors[0].height << std::endl;
+        }
+
         std::cout << "Tablet Size: " << currentTablet.widthMM << "x" << currentTablet.heightMM << "mm" << std::endl;
         std::cout << "Max Resolution: " << currentTablet.maxX << "x" << currentTablet.maxY << std::endl;
         std::cout << std::endl;
@@ -386,15 +538,34 @@ public:
         std::cout << std::endl;
 
         std::cout << "Click Simulation: " << (config.clickEnabled ? "ON" : "OFF") << std::endl;
-        std::cout << "Frequency Logging: " << (enableFrequencyLogging ? "ON" : "OFF") << std::endl;
 
-        // Set frequency line position
+        std::cout << "Logging Mode: ";
+        switch (currentLoggingMode) {
+        case LoggingMode::OFF: std::cout << "OFF"; break;
+        case LoggingMode::FREQUENCY: std::cout << "FREQUENCY"; break;
+        case LoggingMode::PREDICTION: std::cout << "PREDICTION"; break;
+        case LoggingMode::POSITION: std::cout << "POSITION"; break;
+        }
+        std::cout << std::endl;
+
+        // Set logging line position
         CONSOLE_SCREEN_BUFFER_INFO csbi;
-        GetConsoleScreenBufferInfo(consoleHandle, &csbi);
-        const_cast<HighPerformanceTabletDriver*>(this)->frequencyLinePos = csbi.dwCursorPosition;
+        if (GetConsoleScreenBufferInfo(consoleHandle, &csbi)) {
+            const_cast<HighPerformanceTabletDriver*>(this)->loggingLinePos = csbi.dwCursorPosition;
+        }
 
-        if (enableFrequencyLogging) {
-            std::cout << "Tablet: 0 Hz | Program: 0 Hz (Program Hz = processing loop speed)" << std::endl;
+        if (currentLoggingMode != LoggingMode::OFF) {
+            switch (currentLoggingMode) {
+            case LoggingMode::FREQUENCY:
+                std::cout << "Tablet: 0 Hz | Program: 0 Hz | Cursor: 0 Hz" << std::endl;
+                break;
+            case LoggingMode::PREDICTION:
+                std::cout << "Velocity: 0 px/frame | VelX: 0 | VelY: 0 | Prediction: 0 px" << std::endl;
+                break;
+            case LoggingMode::POSITION:
+                std::cout << "Tablet: (0,0) | Screen: (0,0) | Click: NO" << std::endl;
+                break;
+            }
         }
 
         std::cout << std::endl;
@@ -405,11 +576,14 @@ public:
         std::cout << "P: Toggle movement prediction" << std::endl;
         std::cout << "C: Toggle click simulation" << std::endl;
         std::cout << "+/-: Adjust prediction strength" << std::endl;
+        if (monitors.size() > 1) {
+            std::cout << "M: Switch monitor" << std::endl;
+        }
         std::cout << "S: Start/Stop driver" << std::endl;
         std::cout << "Q: Quit" << std::endl;
-        std::cout << "F: Toggle frequency logging" << std::endl;
+        std::cout << "L: Cycle logging mode (OFF->FREQ->PRED->POS)" << std::endl;
         if (running) {
-            std::cout << std::endl << "Driver is RUNNING at HIGH PERFORMANCE. ESC to restart driver." << std::endl;
+            std::cout << std::endl << "Driver is running... ESC to restart driver." << std::endl;
         }
     }
 
@@ -438,17 +612,20 @@ public:
         SaveConfig();
     }
 
-    void ToggleFrequencyLogging() {
-        enableFrequencyLogging = !enableFrequencyLogging;
-
-        if (enableFrequencyLogging) {
-            std::cout << "High-performance frequency logging enabled" << std::endl;
-            if (running && !frequencyThread.joinable()) {
-                frequencyThread = std::thread(&HighPerformanceTabletDriver::FrequencyUpdateLoop, this);
-            }
+    void SwitchMonitor() {
+        if (monitors.size() > 1) {
+            config.currentMonitor = (config.currentMonitor + 1) % monitors.size();
+            SaveConfig();
         }
-        else {
-            std::cout << "Frequency logging disabled" << std::endl;
+    }
+
+    void CycleLoggingMode() {
+        currentLoggingMode = static_cast<LoggingMode>((static_cast<int>(currentLoggingMode) + 1) % 4);
+
+        if (currentLoggingMode != LoggingMode::OFF) {
+            if (running && !loggingThread.joinable()) {
+                loggingThread = std::thread(&HighPerformanceTabletDriver::LoggingUpdateLoop, this);
+            }
         }
     }
 
@@ -470,7 +647,7 @@ public:
     void RestartDriver() {
         if (running) {
             Stop();
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         Start();
     }
@@ -480,9 +657,9 @@ public:
         ShowCurrentSettings();
 
         configThread = std::thread([this]() {
-            SetThreadHighPriority();
+            SetThreadSafePriority();
 
-            while (configMode) {
+            while (configMode && !emergencyShutdown) {
                 if (_kbhit()) {
                     char key = _getch();
 
@@ -530,6 +707,11 @@ public:
                             ConfigureRotation();
                             ShowCurrentSettings();
                             break;
+                        case 'm':
+                        case 'M': // Switch monitor
+                            SwitchMonitor();
+                            ShowCurrentSettings();
+                            break;
                         case 'p':
                         case 'P': // Toggle prediction
                             TogglePrediction();
@@ -565,9 +747,9 @@ public:
                             configMode = false;
                             Stop();
                             break;
-                        case 'f':
-                        case 'F': // Toggle frequency logging
-                            ToggleFrequencyLogging();
+                        case 'l':
+                        case 'L': // Cycle logging mode
+                            CycleLoggingMode();
                             ShowCurrentSettings();
                             break;
                         case 27: // ESC key
@@ -589,30 +771,39 @@ public:
             return;
         }
 
+        emergencyShutdown = false;
         running = true;
         hasLastPosition = false;
+        wasInProximityLast = false;
         lastTouchState = false;
         currentlyPressed = false;
+        
+        hasValidData = false;
+        lastValidRawX = -1;
+        lastValidRawY = -1;
 
         // Clear frequency data
         {
             std::lock_guard<std::mutex> lock(frequencyMutex);
             tabletUpdateTimes.clear();
             programUpdateTimes.clear();
+            cursorUpdateTimes.clear();
             tabletFrequency = 0.0;
             programFrequency = 0.0;
+            cursorUpdateFrequency = 0.0;
         }
 
-        // Start high-priority threads
-        inputThread = std::thread(&HighPerformanceTabletDriver::HighPerformanceInputLoop, this);
-        processingThread = std::thread(&HighPerformanceTabletDriver::HighPerformanceProcessingLoop, this);
+        // Start safe priority threads
+        inputThread = std::thread(&HighPerformanceTabletDriver::SafeInputLoop, this);
+        processingThread = std::thread(&HighPerformanceTabletDriver::SafeProcessingLoop, this);
 
-        if (enableFrequencyLogging) {
-            frequencyThread = std::thread(&HighPerformanceTabletDriver::FrequencyUpdateLoop, this);
+        if (currentLoggingMode != LoggingMode::OFF) {
+            loggingThread = std::thread(&HighPerformanceTabletDriver::LoggingUpdateLoop, this);
         }
     }
 
     void Stop() {
+        emergencyShutdown = true;
         running = false;
 
         // Release any pressed mouse button before stopping
@@ -624,59 +815,82 @@ public:
             currentlyPressed = false;
         }
 
+        // Wait for threads to finish safely
         if (inputThread.joinable()) {
             inputThread.join();
         }
         if (processingThread.joinable()) {
             processingThread.join();
         }
-        if (frequencyThread.joinable()) {
-            frequencyThread.join();
+        if (loggingThread.joinable()) {
+            loggingThread.join();
         }
     }
 
 private:
-    void HighPerformanceInputLoop() {
-        SetThreadHighPriority();
+    // SAFE INPUT LOOP
+    void SafeInputLoop() {
+        SetThreadSafePriority();
 
         BYTE buffer[64];
         DWORD bytesRead;
 
-        while (running) {
-            if (ReadFile(deviceHandle, buffer, sizeof(buffer), &bytesRead, NULL)) {
-                ProcessRawTabletData(buffer, bytesRead);
+        while (running && !emergencyShutdown) {
+            try {
+                if (ReadFile(deviceHandle, buffer, sizeof(buffer), &bytesRead, NULL)) {
+                    ProcessRawTabletData(buffer, bytesRead);
+                }
+            }
+            catch (...) {
+                // Emergency shutdown on any exception
+                emergencyShutdown = true;
+                break;
             }
         }
     }
 
-    void HighPerformanceProcessingLoop() {
-        SetThreadHighPriority();
+    // SAFE PROCESSING LOOP
+    void SafeProcessingLoop() {
+        SetThreadSafePriority();
 
         TabletData* lastProcessedData = nullptr;
+        auto lastUpdate = std::chrono::high_resolution_clock::now();
 
-        while (running) {
-            TabletData* currentData = latestData.load();
+        while (running && !emergencyShutdown) {
+            try {
+                TabletData* currentData = latestData.load();
 
-            UpdateProgramFrequency();
+                UpdateProgramFrequency();
 
-            if (currentData != nullptr && currentData != lastProcessedData) {
-                ProcessTabletMovement(*currentData);
-                lastProcessedData = currentData;
+                if (currentData != nullptr && currentData != lastProcessedData && currentData->isValid) {
+                    ProcessTabletMovement(*currentData);
+                    lastProcessedData = currentData;
+                }
+            }
+            catch (...) {
+                // Emergency shutdown on any exception
+                emergencyShutdown = true;
+                break;
             }
         }
     }
 
-    void FrequencyUpdateLoop() {
-        SetThreadHighPriority();
+    void LoggingUpdateLoop() {
+        SetThreadSafePriority();
 
-        while (running) {
-            UpdateFrequencyDisplay();
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        while (running && !emergencyShutdown) {
+            try {
+                UpdateLoggingDisplay();
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+            catch (...) {
+                break;
+            }
         }
     }
 
     void ProcessRawTabletData(BYTE* buffer, DWORD length) {
-        if (length < 6) return;
+        if (length < 6 || buffer == nullptr) return;
 
         // Get next buffer
         int nextBuffer = 1 - currentBuffer.load();
@@ -687,23 +901,36 @@ private:
         data->isTouching = false;
         data->rawX = 0;
         data->rawY = 0;
+        data->isValid = false;
 
         // Parse data based on tablet type
-        switch (currentTablet.type) {
-        case TabletType::WACOM_CTL672:
-            ParseWacomData(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
-            break;
-        case TabletType::WACOM_CTL472:
-            ParseWacomCTL472Data(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
-            break;
-        case TabletType::XPPEN_STAR_G640:
-            ParseXPPenData(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
-            break;
-        default:
+        try {
+            switch (currentTablet.type) {
+            case TabletType::WACOM_CTL672:
+                ParseWacomData(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
+                break;
+            case TabletType::WACOM_CTL472:
+                ParseWacomCTL472Data(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
+                break;
+            case TabletType::XPPEN_STAR_G640:
+                ParseXPPenData(buffer, length, data->rawX, data->rawY, data->inProximity, data->isTouching);
+                break;
+            default:
+                return;
+            }
+        }
+        catch (...) {
+            // Skip this data packet on parsing error
             return;
         }
 
-        if (data->inProximity || (data->rawX != 0 || data->rawY != 0)) {
+        if (!IsValidTabletData(data->rawX, data->rawY, data->inProximity)) {
+            return;
+        }
+
+        data->isValid = true;
+
+        if (data->inProximity || data->isTouching) {
             UpdateTabletFrequency();
 
             // Atomically swap buffers
@@ -712,8 +939,53 @@ private:
         }
     }
 
+    bool IsValidTabletData(int rawX, int rawY, bool inProximity) {
+        if (rawX < 0 || rawY < 0 || rawX > currentTablet.maxX || rawY > currentTablet.maxY) {
+            return false;
+        }
+
+        if ((rawX == 0 && rawY == 0) && !inProximity) {
+            return false;
+        }
+
+        if (rawX == 0xFFFF || rawY == 0xFFFF || rawX == 0x7FFF || rawY == 0x7FFF) {
+            return false;
+        }
+
+        if (hasValidData.load()) {
+            int lastX = lastValidRawX.load();
+            int lastY = lastValidRawY.load();
+            
+            if (lastX >= 0 && lastY >= 0) {
+                int deltaX = abs(rawX - lastX);
+                int deltaY = abs(rawY - lastY);
+
+                int maxJumpX = (currentTablet.maxX * 80) / 100;
+                int maxJumpY = (currentTablet.maxY * 80) / 100;
+
+                if (deltaX > maxJumpX || deltaY > maxJumpY) {
+                    return false;
+                }
+            }
+        }
+
+        lastValidRawX.store(rawX);
+        lastValidRawY.store(rawY);
+        hasValidData.store(true);
+
+        return true;
+    }
+
     void ProcessTabletMovement(const TabletData& data) {
-        if (!data.inProximity && (data.rawX == 0 && data.rawY == 0)) {
+        if (!data.isValid) {
+            return;
+        }
+
+        // Check if pen was just lifted
+        bool wasJustLifted = wasInProximityLast.load() && !data.inProximity;
+        wasInProximityLast.store(data.inProximity);
+
+        if (!data.inProximity && !data.isTouching) {
             hasLastPosition = false;
             return;
         }
@@ -722,8 +994,18 @@ private:
         int areaLeft, areaRight, areaTop, areaBottom;
         CalculateAreaBounds(areaLeft, areaRight, areaTop, areaBottom);
 
+        // Get current monitor
+        const Monitor& currentMonitor = monitors[config.currentMonitor];
+
+        // Store tablet position for logging
+        currentTabletX.store(data.rawX);
+        currentTabletY.store(data.rawY);
+        isCurrentlyClicking.store(data.isTouching);
+
         // Check if point is within mapping area
         if (data.rawX < areaLeft || data.rawX > areaRight || data.rawY < areaTop || data.rawY > areaBottom) {
+            MoveToNearestEdge(data.rawX, data.rawY, areaLeft, areaRight, areaTop, areaBottom, currentMonitor);
+
             if (config.clickEnabled && currentlyPressed) {
                 HandleMouseClick(false);
             }
@@ -742,34 +1024,99 @@ private:
         ApplyRotation(normalizedX, normalizedY, rotatedNormX, rotatedNormY);
 
         // Map to screen coordinates
-        int baseScreenX = (int)(rotatedNormX * SCREEN_WIDTH);
-        int baseScreenY = (int)(rotatedNormY * SCREEN_HEIGHT);
+        int baseScreenX = currentMonitor.x + (int)(rotatedNormX * currentMonitor.width);
+        int baseScreenY = currentMonitor.y + (int)(rotatedNormY * currentMonitor.height);
 
         // Calculate final position with prediction
         int finalScreenX = baseScreenX;
         int finalScreenY = baseScreenY;
 
-        if (config.movementPrediction && hasLastPosition) {
+        if (config.movementPrediction && hasLastPosition && !wasJustLifted) {
             // Calculate movement vector
             double velocityX = baseScreenX - lastScreenX.load();
             double velocityY = baseScreenY - lastScreenY.load();
 
-            // Apply prediction
-            double predictionFactor = config.predictionStrength * 0.15;
-            finalScreenX += (int)(velocityX * predictionFactor);
-            finalScreenY += (int)(velocityY * predictionFactor);
+            // Store velocity for logging
+            currentVelocityX.store(velocityX);
+            currentVelocityY.store(velocityY);
+
+            // Apply prediction with safer limits
+            double predictionFactor = min(config.predictionStrength * 0.15, 3.0);
+            double predX = velocityX * predictionFactor;
+            double predY = velocityY * predictionFactor;
+
+            finalScreenX += (int)predX;
+            finalScreenY += (int)predY;
+
+            // Store prediction amount for logging
+            predictionAmount.store(sqrt(predX * predX + predY * predY));
+        }
+        else {
+            // Reset prediction logging when not predicting
+            currentVelocityX.store(0.0);
+            currentVelocityY.store(0.0);
+            predictionAmount.store(0.0);
         }
 
-        // Clamp to screen bounds
-        finalScreenX = max(0, min(SCREEN_WIDTH - 1, finalScreenX));
-        finalScreenY = max(0, min(SCREEN_HEIGHT - 1, finalScreenY));
+        // Clamp to current monitor bounds with safety margin
+        int safeMargin = 5;
+        finalScreenX = max(currentMonitor.x + safeMargin,
+            min(currentMonitor.x + currentMonitor.width - safeMargin, finalScreenX));
+        finalScreenY = max(currentMonitor.y + safeMargin,
+            min(currentMonitor.y + currentMonitor.height - safeMargin, finalScreenY));
 
-        SetCursorPos(finalScreenX, finalScreenY);
+        if ((finalScreenX <= currentMonitor.x + 10 && finalScreenY <= currentMonitor.y + 10) ||
+            (finalScreenX >= currentMonitor.x + currentMonitor.width - 10 &&
+                finalScreenY <= currentMonitor.y + 10)) {
+            return;
+        }
+
+        // Use safer cursor positioning
+        try {
+            SetCursorPos(finalScreenX, finalScreenY);
+            UpdateCursorFrequency(); // Track cursor update frequency
+
+            // Store screen position for logging
+            currentScreenX.store(finalScreenX);
+            currentScreenY.store(finalScreenY);
+        }
+        catch (...) {
+            // Ignore cursor positioning errors
+        }
 
         // Store current unpredicted screen position
         lastScreenX.store(baseScreenX);
         lastScreenY.store(baseScreenY);
         hasLastPosition = true;
+    }
+
+    void MoveToNearestEdge(int rawX, int rawY, int areaLeft, int areaRight, int areaTop, int areaBottom, const Monitor& currentMonitor) {
+        // Find the nearest point on the area boundary
+        int nearestX = max(areaLeft, min(areaRight, rawX));
+        int nearestY = max(areaTop, min(areaBottom, rawY));
+
+        // Normalize the nearest point
+        double normalizedX = (double)(nearestX - areaLeft) / (areaRight - areaLeft);
+        double normalizedY = (double)(nearestY - areaTop) / (areaBottom - areaTop);
+
+        // Apply rotation
+        double rotatedNormX, rotatedNormY;
+        ApplyRotation(normalizedX, normalizedY, rotatedNormX, rotatedNormY);
+
+        // Map to screen coordinates
+        int screenX = currentMonitor.x + (int)(rotatedNormX * currentMonitor.width);
+        int screenY = currentMonitor.y + (int)(rotatedNormY * currentMonitor.height);
+
+        // Clamp to monitor bounds
+        screenX = max(currentMonitor.x, min(currentMonitor.x + currentMonitor.width - 1, screenX));
+        screenY = max(currentMonitor.y, min(currentMonitor.y + currentMonitor.height - 1, screenY));
+
+        try {
+            SetCursorPos(screenX, screenY);
+        }
+        catch (...) {
+            // Ignore cursor positioning errors
+        }
     }
 
     void CalculateAreaBounds(int& left, int& right, int& top, int& bottom) const {
@@ -806,92 +1153,131 @@ private:
         // Check for state change
         bool lastTouch = lastTouchState.load();
         if (isTouching != lastTouch) {
-            INPUT input = {};
-            input.type = INPUT_MOUSE;
+            try {
+                INPUT input = {};
+                input.type = INPUT_MOUSE;
 
-            if (isTouching && !currentlyPressed.load()) {
-                // Press down
-                input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-                SendInput(1, &input, sizeof(INPUT));
-                currentlyPressed = true;
-            }
-            else if (!isTouching && currentlyPressed.load()) {
-                // Release
-                input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                SendInput(1, &input, sizeof(INPUT));
-                currentlyPressed = false;
-            }
+                if (isTouching && !currentlyPressed.load()) {
+                    // Press down
+                    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+                    SendInput(1, &input, sizeof(INPUT));
+                    currentlyPressed = true;
+                }
+                else if (!isTouching && currentlyPressed.load()) {
+                    // Release
+                    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+                    SendInput(1, &input, sizeof(INPUT));
+                    currentlyPressed = false;
+                }
 
-            lastTouchState = isTouching;
+                lastTouchState = isTouching;
+            }
+            catch (...) {
+                // Ignore mouse input errors
+            }
         }
     }
 
     void ParseWacomData(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
-        if (length < 8) return;
+        if (length < 8 || data == nullptr) return;
 
-        if (data[0] == 0x01 && length >= 8) {
-            rawX = data[2] | (data[3] << 8);
-            rawY = data[4] | (data[5] << 8);
-            inProximity = (data[1] & 0x01) != 0;
-            isTouching = (data[1] & 0x02) != 0;
+        try {
+            if (data[0] == 0x01 && length >= 8) {
+                rawX = data[2] | (data[3] << 8);
+                rawY = data[4] | (data[5] << 8);
+                inProximity = (data[1] & 0x01) != 0;
+                isTouching = (data[1] & 0x02) != 0;
+            }
+            else if (data[0] == 0x02 && length >= 8) {
+                rawX = data[2] | (data[3] << 8);
+                rawY = data[4] | (data[5] << 8);
+                inProximity = (data[1] & 0x20) != 0;
+                isTouching = (data[1] & 0x01) != 0;
+            }
+            else if (data[0] != 0x00 && length >= 6) {
+                rawX = data[0] | (data[1] << 8);
+                rawY = data[2] | (data[3] << 8);
+                inProximity = (data[4] & 0x01) != 0;
+                isTouching = (data[4] & 0x02) != 0;
+            }
+            else {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+                return;
+            }
+
+            if (rawX == 0xFFFF || rawY == 0xFFFF || rawX == 0x7FFF || rawY == 0x7FFF) {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+            }
         }
-        else if (data[0] == 0x02 && length >= 8) {
-            rawX = data[2] | (data[3] << 8);
-            rawY = data[4] | (data[5] << 8);
-            inProximity = (data[1] & 0x20) != 0;
-            isTouching = (data[1] & 0x01) != 0;
-        }
-        else if (data[0] != 0x00 && length >= 6) {
-            rawX = data[0] | (data[1] << 8);
-            rawY = data[2] | (data[3] << 8);
-            inProximity = (data[4] & 0x01) != 0;
-            isTouching = (data[4] & 0x02) != 0;
+        catch (...) {
+            rawX = rawY = 0;
+            inProximity = isTouching = false;
         }
     }
 
     void ParseWacomCTL472Data(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
-        if (length < 10) return;
+        if (length < 10 || data == nullptr) return;
 
-        if (data[0] == 0x01 || data[0] == 0x02) {
-            // Extract X coordinate
-            rawX = data[2] | (data[3] << 8);
-            // Extract Y coordinate
-            rawY = data[4] | (data[5] << 8);
+        try {
+            if (data[0] == 0x01 || data[0] == 0x02) {
+                rawX = data[2] | (data[3] << 8);
+                rawY = data[4] | (data[5] << 8);
 
-            BYTE status = data[1];
-            inProximity = (status & 0x20) != 0;
-            isTouching = (status & 0x01) != 0;
+                BYTE status = data[1];
+                inProximity = (status & 0x20) != 0;
+                isTouching = (status & 0x01) != 0;
+            }
+            else if (data[0] == 0x10 && length >= 8) {
+                rawX = data[1] | (data[2] << 8);
+                rawY = data[3] | (data[4] << 8);
+                inProximity = (data[5] & 0x40) != 0;
+                isTouching = (data[5] & 0x01) != 0;
+            }
+            else {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+                return;
+            }
+
+            if (rawX == 0xFFFF || rawY == 0xFFFF || rawX == 0x7FFF || rawY == 0x7FFF) {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+            }
         }
-        else if (data[0] == 0x10 && length >= 8) {
-            rawX = data[1] | (data[2] << 8);
-            rawY = data[3] | (data[4] << 8);
-            inProximity = (data[5] & 0x40) != 0;
-            isTouching = (data[5] & 0x01) != 0;
-        }
-        else {
-            inProximity = false;
-            isTouching = false;
+        catch (...) {
+            rawX = rawY = 0;
+            inProximity = isTouching = false;
         }
     }
 
     void ParseXPPenData(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
-        if (length < 14) return;
+        if (length < 14 || data == nullptr) return;
 
-        if (data[0] == 0x02 && (data[1] == 0xA0 || data[1] == 0xA1)) {
-            // X coordinate
-            rawX = data[2] | (data[3] << 8);
-            // Y coordinate
-            rawY = data[4] | (data[5] << 8);
+        try {
+            if (data[0] == 0x02 && (data[1] == 0xA0 || data[1] == 0xA1)) {
+                rawX = data[2] | (data[3] << 8);
+                rawY = data[4] | (data[5] << 8);
 
-            // Proximity detection
-            inProximity = true;
+                inProximity = true;
 
-            // Touch detection
-            isTouching = (data[1] == 0xA1);
+                isTouching = (data[1] == 0xA1);
+            }
+            else {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+                return;
+            }
+
+            if (rawX == 0xFFFF || rawY == 0xFFFF || rawX == 0x7FFF || rawY == 0x7FFF) {
+                rawX = rawY = 0;
+                inProximity = isTouching = false;
+            }
         }
-        else {
-            inProximity = false;
-            isTouching = false;
+        catch (...) {
+            rawX = rawY = 0;
+            inProximity = isTouching = false;
         }
     }
 
@@ -904,34 +1290,38 @@ public:
 };
 
 int main() {
-    HANDLE currentProcess = GetCurrentProcess();
-    SetPriorityClass(currentProcess, REALTIME_PRIORITY_CLASS);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    std::cout << "Ultra Tablet Driver v2.1 - by vilounos (stable)" << std::endl;
+    std::cout << "Optimized for stability and safe high performance" << std::endl;
+    std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G640" << std::endl << std::endl;
 
     timeBeginPeriod(1);
-
-    std::cout << "Ultra Tablet Driver v2.0 - by vilounos" << std::endl;
-    std::cout << "Optimized for >10kHz performance and minimal latency" << std::endl;
-    std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G 640" << std::endl << std::endl;
 
     HighPerformanceTabletDriver driver;
 
     if (!driver.Initialize()) {
-        std::cerr << "Failed to initialize high-performance tablet driver" << std::endl;
+        std::cerr << "Failed to initialize tablet driver" << std::endl;
         std::cout << "Make sure your supported tablet is connected:" << std::endl;
-        std::cout << "- Wacom CTL-672" << std::endl;
+        std::cout << "- Wacom CTL-672 (One by Wacom Medium)" << std::endl;
         std::cout << "- Wacom CTL-472 (One by Wacom Small)" << std::endl;
         std::cout << "- XPPen Star G 640" << std::endl;
+        std::cout << "If your tablet is connected and all drivers are disabled:" << std::endl;
+        std::cout << "- Install and run OpenTabletDriver and than close it (make sure to close it in system tray too)" << std::endl;
+        std::cout << "- Make sure you are running this app ad Administrator" << std::endl;
+        std::cout << "If nothing helps, contact me on Discord: vilounos" << std::endl;
         system("pause");
         timeEndPeriod(1);
         return 1;
     }
 
-    driver.RunConfiguration();
+    try {
+        driver.RunConfiguration();
+        driver.WaitForExit();
+    }
+    catch (...) {
+        std::cout << "Emergency shutdown due to unexpected error" << std::endl;
+    }
 
-    driver.WaitForExit();
-
-    std::cout << "Stopping Ultra Tablet Driver driver..." << std::endl;
+    std::cout << "Stopping Ultra Tablet Driver..." << std::endl;
     driver.Stop();
 
     timeEndPeriod(1);
