@@ -1044,16 +1044,13 @@ private:
             currentAccelerationY.store(accelerationY);
 
             // Apply acceleration-based prediction
-            // Používáme kinematickou rovnici: s = v*t + 0.5*a*t²
-            // Pro prediction používáme t = predictionStrength jako časový faktor
-            double predictionTime = config.predictionStrength * 0.1; // Upravitelný časový faktor
+            double predictionTime = config.predictionStrength * 0.1;
 
             // Predicted position based on current velocity and acceleration
             double predX = velocityX * predictionTime + 0.5 * accelerationX * predictionTime * predictionTime;
             double predY = velocityY * predictionTime + 0.5 * accelerationY * predictionTime * predictionTime;
 
-            // Omezit maximální prediction distance pro stabilitu
-            double maxPredictionDistance = 50.0; // pixely
+            double maxPredictionDistance = 50.0;
             double predictionDistance = sqrt(predX * predX + predY * predY);
 
             if (predictionDistance > maxPredictionDistance) {
