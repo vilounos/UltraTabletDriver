@@ -27,7 +27,13 @@ Note: It might not run well on bad hardware.
 ## How to run:
 Download the latest UltraTabletDriver.exe file from Releases.
 
+Download OpenTabletDriver and run it as administrator.
+
+Close OpenTabletDriver (make sure to close it in system tray too)
+
 Connect your tablet to PC and run UltraTabletDriver.exe as Administrator
+
+Every time you connect/reconnect your tablet to PC, you have to repeat these steps else the driver won't work
 
 ## Common issues:
 - The tablet is not detected by the program - Try closing/terminating every other driver... If it still doesn't work, try running OpenTabletDriver as Administrator and than close it and try again (UltraTabletDriver in current state can't bypass default Windows tablet driver)
