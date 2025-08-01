@@ -5,6 +5,9 @@ It is in C++... That means it is extremly fast and low latency.
 
 It also has a configurable "Prediction" function.
 
+## Current issues:
+- The driver is not working properly with osu!lazer - It feels like playing with 10 Hz poling rate tablet
+
 ## Supported tablets:
 - Wacom CTL-672 (One By Wacom Medium) - the only tested and 100% working tablet
 - Wacom CTL-472 (One By Wacom Small)
