@@ -1,17 +1,18 @@
 # UltraTabletDriver
 This is really good tablet driver mostly for playing Osu!
 
-It is in C++... That means it is extremly fast and low latency.
+It is in C++... That means it is extremly fast and low latency - Faster than OpenTabletDriver
 
 ## Features:
 - Prediction: Predicts where you most likely want to move your cursor (might add snaps, configruable)
 - Interpolation: Generates cursor steps to fill gaps between every tablet update (might increase input latency, configurable)
 - Custom tablet area (size, location, rotation)
 - Monitor switching
+- Simple GUI
 
 
 ## Current issues:
-- None
+- Prediction and Interpolation are not compatible (causes crazy snapping)
 
 ## Supported tablets:
 - Wacom CTL-672 (One By Wacom Medium) - the only tested and 100% working tablet
@@ -19,7 +20,7 @@ It is in C++... That means it is extremly fast and low latency.
 - XP Pen Star G640
 
 ## Minimum requirements:
-- CPU with at least 4 threads
+- CPU with at least 4 threads recommended - The driver is CPU based + uses multithreadning
 - Windows 10/11 - tested on 11 only
 - One of the supported tablets
 
