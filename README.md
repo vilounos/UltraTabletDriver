@@ -4,14 +4,14 @@ This is really good tablet driver mostly for playing Osu!
 It is in C++... That means it is extremly fast and low latency.
 
 ## Features:
-- Prediction: Predicts where you most likely want to move your cursor (configruable)
+- Prediction: Predicts where you most likely want to move your cursor (might add snaps, configruable)
 - Interpolation: Generates cursor steps to fill gaps between every tablet update (might increase input latency, configurable)
 - Custom tablet area (size, location, rotation)
 - Monitor switching
 
 
 ## Current issues:
-- Interpolation is slow, unstable - WIP
+- None
 
 ## Supported tablets:
 - Wacom CTL-672 (One By Wacom Medium) - the only tested and 100% working tablet
@@ -20,6 +20,7 @@ It is in C++... That means it is extremly fast and low latency.
 
 ## Minimum requirements:
 - CPU with at least 4 threads
+- Windows 10/11 - tested on 11 only
 - One of the supported tablets
 
 Note: It might not run well on bad hardware.
@@ -37,4 +38,3 @@ Every time you connect/reconnect your tablet to PC, you have to repeat these ste
 
 ## Common issues:
 - The tablet is not detected by the program - Try closing/terminating every other driver... If it still doesn't work, try running OpenTabletDriver as Administrator and than close it and try again (UltraTabletDriver in current state can't bypass default Windows tablet driver)
-- I can't move the cursor using the pen when I am playing Osu! - You have to disable Raw Input in Osu! settings (Raw input support - work in progress)
