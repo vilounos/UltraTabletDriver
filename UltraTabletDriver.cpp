@@ -20,11 +20,19 @@
 #include <pmmintrin.h>
 #include <smmintrin.h>
 #include <intrin.h>
+#include <commctrl.h>
+#include <gdiplus.h>
 
+
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "gdiplus.lib")
+
+using namespace Gdiplus;
+
 
 struct alignas(16) Vec2f {
     float x, y;
@@ -32,6 +40,10 @@ struct alignas(16) Vec2f {
 
     Vec2f() : x(0.0f), y(0.0f), _pad{ 0.0f, 0.0f } {}
     Vec2f(float x_, float y_) : x(x_), y(y_), _pad{ 0.0f, 0.0f } {}
+
+    inline void Prefetch() const {
+        _mm_prefetch(reinterpret_cast<const char*>(this), _MM_HINT_T0);
+    }
 };
 
 struct alignas(16) Vec4f {
@@ -47,7 +59,12 @@ struct alignas(16) Vec2i {
 
     Vec2i() : x(0), y(0), _pad{ 0, 0 } {}
     Vec2i(int x_, int y_) : x(x_), y(y_), _pad{ 0, 0 } {}
+
+    inline void Prefetch() const {
+        _mm_prefetch(reinterpret_cast<const char*>(this), _MM_HINT_T0);
+    }
 };
+
 
 class SIMDMath {
 public:
@@ -204,13 +221,6 @@ public:
     }
 };
 
-enum class RotationType {
-    NONE = 0,
-    LEFT = 1,
-    FLIP = 2,
-    RIGHT = 3
-};
-
 enum class TabletType {
     UNKNOWN = 0,
     WACOM_CTL672 = 1,
@@ -240,14 +250,69 @@ struct alignas(16) InterpolationSample {
     float _pad;
 };
 
+
 static const int INTERPOLATION_BUFFER_SIZE = 16;
-alignas(16) InterpolationSample interpolationBuffer[INTERPOLATION_BUFFER_SIZE];
-std::atomic<int> interpolationWriteIndex{ 0 };
-std::atomic<int> interpolationReadIndex{ 0 };
-std::atomic<int> interpolationSampleCount{ 0 };
 
 bool interpolationEnabled = true;
 int interpolationMultiplier = 2;
+template<typename T, size_t Size>
+class alignas(64) LockFreeRingBuffer {
+
+private:
+    static_assert((Size& (Size - 1)) == 0, "Size must be power of 2");
+
+    alignas(64) T buffer[Size];
+    alignas(64) volatile uint64_t writeIndex;
+    alignas(64) volatile uint64_t readIndex;
+
+    static constexpr uint64_t MASK = Size - 1;
+
+public:
+    LockFreeRingBuffer() : writeIndex(0), readIndex(0) {}
+
+
+    __forceinline bool TryPush(const T& item) {
+        const uint64_t currentWrite = writeIndex;
+        const uint64_t nextWrite = currentWrite + 1;
+
+        if ((nextWrite & MASK) == (readIndex & MASK)) {
+            return false;
+        }
+
+        buffer[currentWrite & MASK] = item;
+
+
+        _mm_sfence();
+        writeIndex = nextWrite;
+
+        return true;
+    }
+
+
+    __forceinline bool TryPop(T& item) {
+        const uint64_t currentRead = readIndex;
+
+        if (currentRead == writeIndex) {
+            return false;
+        }
+
+        item = buffer[currentRead & MASK];
+
+
+        _mm_lfence();
+        readIndex = currentRead + 1;
+
+        return true;
+    }
+
+    __forceinline bool IsEmpty() const {
+        return readIndex == writeIndex;
+    }
+
+    __forceinline size_t Size() const {
+        return (writeIndex - readIndex) & MASK;
+    }
+};
 
 struct DriverConfig {
     int areaWidth = 28;
@@ -270,57 +335,735 @@ struct alignas(16) TabletData {
     std::chrono::high_resolution_clock::time_point timestamp;
 };
 
+template<typename T, size_t PoolSize>
+class alignas(64) ObjectPool {
+private:
+    alignas(64) T pool[PoolSize];
+    alignas(64) std::atomic<uint32_t> freeList[PoolSize];
+    alignas(64) std::atomic<uint32_t> freeHead{ 0 };
+    alignas(64) std::atomic<uint32_t> allocCount{ 0 };
+
+public:
+    ObjectPool() {
+        for (uint32_t i = 0; i < PoolSize; i++) {
+            freeList[i].store(i);
+        }
+    }
+
+    T* Acquire() {
+        uint32_t head = freeHead.load(std::memory_order_relaxed);
+        while (head < PoolSize) {
+            if (freeHead.compare_exchange_weak(head, head + 1, std::memory_order_acq_rel)) {
+                allocCount.fetch_add(1, std::memory_order_relaxed);
+                return &pool[freeList[head].load()];
+            }
+        }
+        return nullptr;
+    }
+
+    void Release(T* obj) {
+        if (!obj) return;
+        uint32_t index = static_cast<uint32_t>(obj - pool);
+        if (index >= PoolSize) return;
+
+        uint32_t head = freeHead.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        freeList[head].store(index, std::memory_order_release);
+        allocCount.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    size_t GetAllocatedCount() const {
+        return allocCount.load(std::memory_order_relaxed);
+    }
+};
+
+template<typename T, size_t PoolSize, size_t Alignment = 64>
+class alignas(64) HighPerformancePool {
+private:
+
+    alignas(Alignment) char storage[PoolSize * sizeof(T)];
+    alignas(64) std::atomic<uint32_t> freeStack[PoolSize];
+    alignas(64) std::atomic<uint32_t> freeTop{ 0 };
+    alignas(64) std::atomic<uint32_t> allocCount{ 0 };
+
+
+    alignas(64) volatile uint32_t nextHint { 0 };
+
+public:
+    HighPerformancePool() {
+
+        for (uint32_t i = 0; i < PoolSize; i++) {
+            freeStack[i].store(i, std::memory_order_relaxed);
+        }
+
+
+        for (size_t i = 0; i < min(PoolSize * sizeof(T), 4 * 64); i += 64) {
+            _mm_prefetch(storage + i, _MM_HINT_T1);
+        }
+    }
+
+    __forceinline T* AcquireFast() {
+        uint32_t top = freeTop.load(std::memory_order_acquire);
+
+        if (top >= PoolSize) {
+            return nullptr;
+        }
+
+
+        if (!freeTop.compare_exchange_weak(top, top + 1,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        uint32_t index = freeStack[top].load(std::memory_order_relaxed);
+        T* ptr = reinterpret_cast<T*>(storage + index * sizeof(T));
+
+
+        if (top + 1 < PoolSize) {
+            uint32_t nextIndex = freeStack[top + 1].load(std::memory_order_relaxed);
+            _mm_prefetch(storage + nextIndex * sizeof(T), _MM_HINT_T0);
+        }
+
+        allocCount.fetch_add(1, std::memory_order_relaxed);
+        return ptr;
+    }
+
+    __forceinline void ReleaseFast(T* ptr) {
+        if (!ptr) return;
+
+        uint32_t index = static_cast<uint32_t>((reinterpret_cast<char*>(ptr) - storage) / sizeof(T));
+        if (index >= PoolSize) return;
+
+        uint32_t top = freeTop.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        freeStack[top].store(index, std::memory_order_release);
+        allocCount.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    size_t GetAllocatedCount() const {
+        return allocCount.load(std::memory_order_relaxed);
+    }
+
+    bool IsFull() const {
+        return freeTop.load(std::memory_order_acquire) >= PoolSize;
+    }
+};
+
+struct alignas(64) VelocityHistorySOA {
+    static const int HISTORY_SIZE = 16;
+
+
+    alignas(64) float velocityX[HISTORY_SIZE];
+    alignas(64) float velocityY[HISTORY_SIZE];
+    alignas(64) float weights[HISTORY_SIZE];
+    alignas(64) uint64_t timestamps[HISTORY_SIZE];
+
+    alignas(64) std::atomic<int> writeIndex{ 0 };
+    alignas(64) std::atomic<int> count{ 0 };
+
+    VelocityHistorySOA() {
+        memset(velocityX, 0, sizeof(velocityX));
+        memset(velocityY, 0, sizeof(velocityY));
+        memset(weights, 0, sizeof(weights));
+        memset(timestamps, 0, sizeof(timestamps));
+    }
+
+    __forceinline void AddSample(float vx, float vy, uint64_t timestamp) {
+        int idx = writeIndex.load(std::memory_order_relaxed);
+
+        velocityX[idx] = vx;
+        velocityY[idx] = vy;
+        timestamps[idx] = timestamp;
+        weights[idx] = 1.0f;
+
+        writeIndex.store((idx + 1) % HISTORY_SIZE, std::memory_order_release);
+
+        int currentCount = count.load(std::memory_order_relaxed);
+        if (currentCount < HISTORY_SIZE) {
+            count.store(currentCount + 1, std::memory_order_release);
+        }
+    }
+
+    __forceinline Vec2f CalculateWeightedAverage() const {
+        int sampleCount = count.load(std::memory_order_acquire);
+        if (sampleCount == 0) return Vec2f(0.0f, 0.0f);
+
+
+        _mm_prefetch(reinterpret_cast<const char*>(velocityX), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(velocityY), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(weights), _MM_HINT_T0);
+
+        __m128 sumX = _mm_setzero_ps();
+        __m128 sumY = _mm_setzero_ps();
+        __m128 totalWeight = _mm_setzero_ps();
+
+
+        int simdCount = (sampleCount / 4) * 4;
+        for (int i = 0; i < simdCount; i += 4) {
+            __m128 vx = _mm_load_ps(&velocityX[i]);
+            __m128 vy = _mm_load_ps(&velocityY[i]);
+            __m128 w = _mm_load_ps(&weights[i]);
+
+            sumX = _mm_add_ps(sumX, _mm_mul_ps(vx, w));
+            sumY = _mm_add_ps(sumY, _mm_mul_ps(vy, w));
+            totalWeight = _mm_add_ps(totalWeight, w);
+        }
+
+
+        for (int i = simdCount; i < sampleCount; i++) {
+            sumX = _mm_add_ss(sumX, _mm_mul_ss(_mm_load_ss(&velocityX[i]), _mm_load_ss(&weights[i])));
+            sumY = _mm_add_ss(sumY, _mm_mul_ss(_mm_load_ss(&velocityY[i]), _mm_load_ss(&weights[i])));
+            totalWeight = _mm_add_ss(totalWeight, _mm_load_ss(&weights[i]));
+        }
+
+
+        sumX = _mm_hadd_ps(sumX, sumX);
+        sumX = _mm_hadd_ps(sumX, sumX);
+        sumY = _mm_hadd_ps(sumY, sumY);
+        sumY = _mm_hadd_ps(sumY, sumY);
+        totalWeight = _mm_hadd_ps(totalWeight, totalWeight);
+        totalWeight = _mm_hadd_ps(totalWeight, totalWeight);
+
+        float weightSum = _mm_cvtss_f32(totalWeight);
+        if (weightSum > 0.0f) {
+            return Vec2f(_mm_cvtss_f32(sumX) / weightSum, _mm_cvtss_f32(sumY) / weightSum);
+        }
+
+        return Vec2f(0.0f, 0.0f);
+    }
+
+    void Clear() {
+        count.store(0, std::memory_order_release);
+        writeIndex.store(0, std::memory_order_release);
+    }
+};
+
 class HighPerformanceTabletDriver {
 private:
 
-    struct alignas(16) AdvancedInterpolationSample {
-        Vec2f screenPos;
-        Vec2f velocity;
-        float pressure;
-        std::chrono::high_resolution_clock::time_point timestamp;
-        bool valid;
-        float _pad[3];
+    static HighPerformancePool<TabletData, 128> tabletPool;
+    static HighPerformancePool<InterpolationSample, 256> interpolationPool;
+
+
+    static constexpr size_t BATCH_BUFFER_SIZE = 8;
+    LockFreeRingBuffer<TabletData, BATCH_BUFFER_SIZE> batchBuffer;
+
+
+    struct alignas(64) TabletLookupTable {
+        float scaleX, scaleY;
+        int maxX, maxY;
+        int centerOffsetX, centerOffsetY;
+    } tabletLookup;
+
+
+    VelocityHistorySOA velocityHistory;
+
+
+    alignas(16) Vec2f workingPositions[32];
+    alignas(16) float workingWeights[32];
+    alignas(16) uint64_t workingTimestamps[32];
+
+
+    DWORD_PTR systemAffinityMask;
+    DWORD_PTR processAffinityMask;
+    std::vector<int> availableCores;
+
+
+    std::chrono::high_resolution_clock::time_point lastPositionTime;
+    std::chrono::high_resolution_clock::time_point secondLastPositionTime;
+
+
+private:
+    static constexpr size_t TABLET_BUFFER_SIZE = 32;
+    LockFreeRingBuffer<TabletData, TABLET_BUFFER_SIZE> tabletDataBuffer;
+
+
+    alignas(64) TabletData fastAccessData;
+    volatile bool fastDataValid = false;
+
+private:
+    static constexpr size_t INTERP_BUFFER_SIZE = 64;
+    LockFreeRingBuffer<InterpolationSample, INTERP_BUFFER_SIZE> interpolationRingBuffer;
+
+private:
+
+    HWND mainWindow = nullptr;
+    HWND statusLabel = nullptr;
+    HWND visualArea = nullptr;
+    std::thread guiThread;
+    std::atomic<bool> guiRunning{ false };
+    GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+
+
+    enum {
+
+        ID_CENTER_UP = 1001, ID_CENTER_DOWN, ID_CENTER_LEFT, ID_CENTER_RIGHT,
+
+
+        ID_AREA_WIDTH_DEC, ID_AREA_WIDTH_INC,
+        ID_AREA_HEIGHT_DEC, ID_AREA_HEIGHT_INC,
+
+
+        ID_ROTATION_TOGGLE, ID_MONITOR_SWITCH,
+        ID_START_STOP,
+
+
+        ID_PREDICTION_TOGGLE, ID_PREDICTION_STR_DEC, ID_PREDICTION_STR_INC,
+        ID_CLICK_TOGGLE,
+        ID_INTERPOLATION_TOGGLE, ID_INTERP_MULT_DEC, ID_INTERP_MULT_INC,
+
+
+        ID_VISUAL_AREA = 2000
     };
 
+    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+        HighPerformanceTabletDriver* driver = nullptr;
+
+        if (uMsg == WM_NCCREATE) {
+            CREATESTRUCT* pCreate = reinterpret_cast<CREATESTRUCT*>(lParam);
+            driver = reinterpret_cast<HighPerformanceTabletDriver*>(pCreate->lpCreateParams);
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(driver));
+        }
+        else {
+            driver = reinterpret_cast<HighPerformanceTabletDriver*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+        }
+
+        if (driver) {
+            return driver->HandleWindowMessage(hwnd, uMsg, wParam, lParam);
+        }
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK VisualAreaProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+        HighPerformanceTabletDriver* driver = reinterpret_cast<HighPerformanceTabletDriver*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
+
+        if (uMsg == WM_PAINT && driver) {
+            driver->DrawTabletArea(hwnd);
+            return 0;
+        }
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+
+    LRESULT HandleWindowMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+        switch (uMsg) {
+        case WM_CREATE:
+            CreateControls(hwnd);
+            return 0;
+
+        case WM_COMMAND:
+            HandleCommand(LOWORD(wParam));
+            return 0;
+
+        case WM_CLOSE:
+
+            if (running) {
+                Stop();
+            }
+
+
+            guiRunning = false;
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_DESTROY:
+
+            GdiplusShutdown(gdiplusToken);
+            PostQuitMessage(0);
+            return 0;
+        }
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+
+    void CreateControls(HWND hwnd) {
+        int leftCol = 20;
+        int rightCol = 280;
+        int y = 20;
+
+
+        CreateWindow(L"STATIC", L"═══ TABLET AREA ═══", WS_VISIBLE | WS_CHILD | SS_CENTER,
+            leftCol, y, 240, 25, hwnd, nullptr, nullptr, nullptr);
+        y += 35;
+
+
+        WNDCLASS visualClass = {};
+        visualClass.lpfnWndProc = VisualAreaProc;
+        visualClass.hInstance = GetModuleHandle(nullptr);
+        visualClass.lpszClassName = L"VisualArea";
+        visualClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+        RegisterClass(&visualClass);
+
+        visualArea = CreateWindow(L"VisualArea", L"", WS_VISIBLE | WS_CHILD | WS_BORDER,
+            leftCol + 20, y, 200, 150, hwnd, (HMENU)ID_VISUAL_AREA, nullptr, nullptr);
+        SetWindowLongPtr(visualArea, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        y += 160;
+
+
+        CreateWindow(L"BUTTON", L"↑", WS_VISIBLE | WS_CHILD,
+            leftCol + 85, y, 30, 25, hwnd, (HMENU)ID_CENTER_UP, nullptr, nullptr);
+        y += 30;
+
+        CreateWindow(L"BUTTON", L"←", WS_VISIBLE | WS_CHILD,
+            leftCol + 50, y, 30, 25, hwnd, (HMENU)ID_CENTER_LEFT, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"→", WS_VISIBLE | WS_CHILD,
+            leftCol + 120, y, 30, 25, hwnd, (HMENU)ID_CENTER_RIGHT, nullptr, nullptr);
+        y += 30;
+
+        CreateWindow(L"BUTTON", L"↓", WS_VISIBLE | WS_CHILD,
+            leftCol + 85, y, 30, 25, hwnd, (HMENU)ID_CENTER_DOWN, nullptr, nullptr);
+        y += 40;
+
+
+        CreateWindow(L"STATIC", L"Position:", WS_VISIBLE | WS_CHILD,
+            leftCol, y, 100, 20, hwnd, nullptr, nullptr, nullptr);
+        y += 25;
+        std::wstring posText = L"X: " + std::to_wstring(config.areaCenterX) +
+            L"mm, Y: " + std::to_wstring(config.areaCenterY) + L"mm";
+        CreateWindow(L"STATIC", posText.c_str(), WS_VISIBLE | WS_CHILD | SS_CENTER,
+            leftCol, y, 200, 20, hwnd, nullptr, nullptr, nullptr);
+        y += 35;
+
+
+        CreateWindow(L"STATIC", L"Area width:", WS_VISIBLE | WS_CHILD,
+            leftCol, y, 100, 20, hwnd, nullptr, nullptr, nullptr);
+        y += 25;
+        CreateWindow(L"STATIC", (std::to_wstring(config.areaWidth) + L" mm").c_str(),
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            leftCol + 20, y, 60, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
+            leftCol + 90, y, 25, 25, hwnd, (HMENU)ID_AREA_WIDTH_DEC, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
+            leftCol + 120, y, 25, 25, hwnd, (HMENU)ID_AREA_WIDTH_INC, nullptr, nullptr);
+        y += 35;
+
+
+        CreateWindow(L"STATIC", L"Area height:", WS_VISIBLE | WS_CHILD,
+            leftCol, y, 100, 20, hwnd, nullptr, nullptr, nullptr);
+        y += 25;
+        CreateWindow(L"STATIC", (std::to_wstring(config.areaHeight) + L" mm").c_str(),
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            leftCol + 20, y, 60, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
+            leftCol + 90, y, 25, 25, hwnd, (HMENU)ID_AREA_HEIGHT_DEC, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
+            leftCol + 120, y, 25, 25, hwnd, (HMENU)ID_AREA_HEIGHT_INC, nullptr, nullptr);
+        y += 40;
+
+
+        CreateWindow(L"STATIC", L"═══ SETTINGS ═══", WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol, 20, 200, 25, hwnd, nullptr, nullptr, nullptr);
+
+        int rightY = 55;
+
+
+        HWND startStopBtn = CreateWindow(L"BUTTON", running ? L"STOP" : L"START",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            rightCol, rightY, 180, 40, hwnd, (HMENU)ID_START_STOP, nullptr, nullptr);
+
+
+        HFONT bigFont = CreateFont(16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+        SendMessage(startStopBtn, WM_SETFONT, (WPARAM)bigFont, TRUE);
+        rightY += 55;
+
+
+        CreateWindow(L"STATIC", L"Rotation:", WS_VISIBLE | WS_CHILD,
+            rightCol, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+        rightY += 25;
+        CreateWindow(L"STATIC", GetRotationText().c_str(), WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol + 20, rightY, 100, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"Change", WS_VISIBLE | WS_CHILD,
+            rightCol + 130, rightY, 50, 25, hwnd, (HMENU)ID_ROTATION_TOGGLE, nullptr, nullptr);
+        rightY += 35;
+
+
+        if (monitors.size() > 1) {
+            CreateWindow(L"STATIC", L"Monitor:", WS_VISIBLE | WS_CHILD,
+                rightCol, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+            rightY += 25;
+            CreateWindow(L"STATIC", (std::to_wstring(config.currentMonitor + 1) + L"/" + std::to_wstring(monitors.size())).c_str(),
+                WS_VISIBLE | WS_CHILD | SS_CENTER, rightCol + 20, rightY, 60, 20, hwnd, nullptr, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
+                rightCol + 90, rightY, 60, 25, hwnd, (HMENU)ID_MONITOR_SWITCH, nullptr, nullptr);
+            rightY += 40;
+        }
+
+
+        CreateWindow(L"STATIC", L"═══ ADVANCED ═══", WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol, rightY, 200, 25, hwnd, nullptr, nullptr, nullptr);
+        rightY += 35;
+
+
+        CreateWindow(L"STATIC", L"Prediction:", WS_VISIBLE | WS_CHILD,
+            rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
+        rightY += 25;
+        CreateWindow(L"STATIC", config.movementPrediction ? L"ON" : L"OFF",
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol + 20, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
+            rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_PREDICTION_TOGGLE, nullptr, nullptr);
+        rightY += 30;
+
+        if (config.movementPrediction) {
+            CreateWindow(L"STATIC", L"Strength:", WS_VISIBLE | WS_CHILD,
+                rightCol + 10, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+            rightY += 25;
+            CreateWindow(L"STATIC", std::to_wstring(config.predictionStrength).c_str(),
+                WS_VISIBLE | WS_CHILD | SS_CENTER,
+                rightCol + 30, rightY, 40, 20, hwnd, nullptr, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
+                rightCol + 80, rightY, 25, 25, hwnd, (HMENU)ID_PREDICTION_STR_DEC, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
+                rightCol + 110, rightY, 25, 25, hwnd, (HMENU)ID_PREDICTION_STR_INC, nullptr, nullptr);
+            rightY += 35;
+        }
+
+
+        CreateWindow(L"STATIC", L"Clicks:", WS_VISIBLE | WS_CHILD,
+            rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
+        rightY += 25;
+        CreateWindow(L"STATIC", config.clickEnabled ? L"ON" : L"OFF",
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol + 20, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
+            rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_CLICK_TOGGLE, nullptr, nullptr);
+        rightY += 35;
+
+
+        CreateWindow(L"STATIC", L"Interpolation:", WS_VISIBLE | WS_CHILD,
+            rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
+        rightY += 25;
+        CreateWindow(L"STATIC", interpolationEnabled ? L"ON" : L"OFF",
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol + 20, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
+            rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_INTERPOLATION_TOGGLE, nullptr, nullptr);
+        rightY += 30;
+
+        if (interpolationEnabled) {
+            CreateWindow(L"STATIC", L"Multiplier:", WS_VISIBLE | WS_CHILD,
+                rightCol + 10, rightY, 70, 20, hwnd, nullptr, nullptr, nullptr);
+            rightY += 25;
+            CreateWindow(L"STATIC", (std::to_wstring(interpolationMultiplier) + L"x").c_str(),
+                WS_VISIBLE | WS_CHILD | SS_CENTER,
+                rightCol + 30, rightY, 40, 20, hwnd, nullptr, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
+                rightCol + 80, rightY, 25, 25, hwnd, (HMENU)ID_INTERP_MULT_DEC, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
+                rightCol + 110, rightY, 25, 25, hwnd, (HMENU)ID_INTERP_MULT_INC, nullptr, nullptr);
+            rightY += 35;
+        }
+    }
+
+    std::wstring GetRotationText() {
+        switch (config.rotation) {
+        case 0: return L"0°";
+        case 1: return L"90°";
+        case 2: return L"180°";
+        case 3: return L"270°";
+        default: return L"0°";
+        }
+    }
+
+    void DrawTabletArea(HWND hwnd) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+
+        RECT rect;
+        GetClientRect(hwnd, &rect);
+        int width = rect.right - rect.left;
+        int height = rect.bottom - rect.top;
+
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
+        HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+
+        Graphics graphics(memDC);
+        graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+
+
+        SolidBrush bgBrush(Color(240, 240, 240));
+        graphics.FillRectangle(&bgBrush, 0, 0, width, height);
+
+
+        SolidBrush tabletBrush(Color(100, 100, 100));
+        Pen tabletPen(Color(60, 60, 60), 2);
+        int tabletMargin = 10;
+        graphics.FillRectangle(&tabletBrush, tabletMargin, tabletMargin,
+            width - 2 * tabletMargin, height - 2 * tabletMargin);
+        graphics.DrawRectangle(&tabletPen, tabletMargin, tabletMargin,
+            width - 2 * tabletMargin, height - 2 * tabletMargin);
+
+
+        float areaWidthRatio, areaHeightRatio;
+
+
+        if (config.rotation == 0 || config.rotation == 2) {
+            areaWidthRatio = (float)config.areaHeight / currentTablet.widthMM;
+            areaHeightRatio = (float)config.areaWidth / currentTablet.heightMM;
+        }
+        else {
+            areaWidthRatio = (float)config.areaWidth / currentTablet.widthMM;
+            areaHeightRatio = (float)config.areaHeight / currentTablet.heightMM;
+        }
+
+        float areaCenterXRatio = (float)config.areaCenterX / currentTablet.widthMM;
+        float areaCenterYRatio = (float)config.areaCenterY / currentTablet.heightMM;
+
+        int availableWidth = width - 2 * tabletMargin - 4;
+        int availableHeight = height - 2 * tabletMargin - 4;
+
+        int areaWidth = (int)(availableWidth * areaWidthRatio);
+        int areaHeight = (int)(availableHeight * areaHeightRatio);
+        int areaCenterX = tabletMargin + 2 + (int)(availableWidth * areaCenterXRatio);
+        int areaCenterY = tabletMargin + 2 + (int)(availableHeight * areaCenterYRatio);
+
+        int areaLeft = areaCenterX - areaWidth / 2;
+        int areaTop = areaCenterY - areaHeight / 2;
+
+
+        Color areaColor = running ? Color(100, 255, 100, 120) : Color(255, 255, 100, 120);
+        SolidBrush areaBrush(areaColor);
+        Pen areaPen(running ? Color(0, 200, 0) : Color(200, 200, 0), 2);
+
+        graphics.FillRectangle(&areaBrush, areaLeft, areaTop, areaWidth, areaHeight);
+        graphics.DrawRectangle(&areaPen, areaLeft, areaTop, areaWidth, areaHeight);
+
+
+        SolidBrush centerBrush(Color(255, 0, 0));
+        graphics.FillEllipse(&centerBrush, areaCenterX - 3, areaCenterY - 3, 6, 6);
+
+
+        std::wstring sizeText;
+        sizeText = std::to_wstring(config.areaWidth) + L"×" + std::to_wstring(config.areaHeight) + L"mm";
+
+        FontFamily fontFamily(L"Segoe UI");
+        Font font(&fontFamily, 9, FontStyleRegular, UnitPoint);
+        SolidBrush textBrush(Color(0, 0, 0));
+        graphics.DrawString(sizeText.c_str(), -1, &font, PointF(5, 5), &textBrush);
+
+
+        BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
+
+
+        SelectObject(memDC, oldBitmap);
+        DeleteObject(memBitmap);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+    }
+
+
+    void UpdateVelocityHistory(const Vec2f& newPosition, std::chrono::high_resolution_clock::time_point timestamp) {
+        if (!hasLastPosition.load()) {
+            lastPositionTime = timestamp;
+            return;
+        }
+
+        Vec2f lastPos = lastScreenPos.load();
+        lastPos.Prefetch();
+
+        auto timeDiff = std::chrono::duration_cast<std::chrono::microseconds>(timestamp - lastPositionTime);
+        float deltaTime = timeDiff.count() / 1000000.0f;
+
+        if (deltaTime > 0.0f && deltaTime < 0.1f) {
+            __m128 vnewPos = _mm_set_ps(0.0f, 0.0f, newPosition.y, newPosition.x);
+            __m128 vlastPos = _mm_set_ps(0.0f, 0.0f, lastPos.y, lastPos.x);
+            __m128 vdelta = _mm_sub_ps(vnewPos, vlastPos);
+            __m128 vdeltaTime = _mm_set1_ps(1.0f / deltaTime);
+            __m128 vvelocity = _mm_mul_ps(vdelta, vdeltaTime);
+
+            float velocityData[4];
+            _mm_store_ps(velocityData, vvelocity);
+
+            uint64_t timestampMicros = std::chrono::duration_cast<std::chrono::microseconds>(
+                timestamp.time_since_epoch()).count();
+
+            velocityHistory.AddSample(velocityData[0], velocityData[1], timestampMicros);
+        }
+
+        secondLastPositionTime = lastPositionTime;
+        lastPositionTime = timestamp;
+    }
+
+    Vec2f CalculateSmoothedVelocity() {
+        return velocityHistory.CalculateWeightedAverage();
+    }
+
+    void HandleCommand(int commandId) {
+        switch (commandId) {
+
+        case ID_CENTER_UP: MoveAreaCenter(0, -1); break;
+        case ID_CENTER_DOWN: MoveAreaCenter(0, 1); break;
+        case ID_CENTER_LEFT: MoveAreaCenter(-1, 0); break;
+        case ID_CENTER_RIGHT: MoveAreaCenter(1, 0); break;
+
+
+        case ID_AREA_WIDTH_DEC: AdjustAreaSize(-1, 0); break;
+        case ID_AREA_WIDTH_INC: AdjustAreaSize(1, 0); break;
+        case ID_AREA_HEIGHT_DEC: AdjustAreaSize(0, -1); break;
+        case ID_AREA_HEIGHT_INC: AdjustAreaSize(0, 1); break;
+
+
+        case ID_ROTATION_TOGGLE: ConfigureRotation(); break;
+        case ID_MONITOR_SWITCH: SwitchMonitor(); break;
+        case ID_START_STOP:
+            if (running) Stop();
+            else Start();
+            break;
+
+
+        case ID_PREDICTION_TOGGLE: TogglePrediction(); break;
+        case ID_PREDICTION_STR_DEC: AdjustPredictionStrength(-1); break;
+        case ID_PREDICTION_STR_INC: AdjustPredictionStrength(1); break;
+        case ID_CLICK_TOGGLE: ToggleClick(); break;
+        case ID_INTERPOLATION_TOGGLE: ToggleInterpolation(); break;
+        case ID_INTERP_MULT_DEC: AdjustInterpolationMultiplier(-1); break;
+        case ID_INTERP_MULT_INC: AdjustInterpolationMultiplier(1); break;
+        }
+
+        UpdateGUI();
+    }
+
+    void UpdateGUI() {
+
+        if (visualArea) {
+            InvalidateRect(visualArea, nullptr, FALSE);
+        }
+
+
+        if (mainWindow) {
+
+            RECT windowRect;
+            GetWindowRect(mainWindow, &windowRect);
+
+
+            EnumChildWindows(mainWindow, [](HWND hwnd, LPARAM lParam) -> BOOL {
+                HWND visualArea = reinterpret_cast<HWND>(lParam);
+                if (hwnd != visualArea) {
+                    DestroyWindow(hwnd);
+                }
+                return TRUE;
+                }, reinterpret_cast<LPARAM>(visualArea));
+
+
+            CreateControls(mainWindow);
+
+
+            UpdateWindow(mainWindow);
+        }
+    }
+
+private:
     static const int ADVANCED_INTERPOLATION_BUFFER_SIZE = 32;
-    alignas(16) AdvancedInterpolationSample advancedInterpolationBuffer[ADVANCED_INTERPOLATION_BUFFER_SIZE];
     std::atomic<int> advancedInterpolationWriteIndex{ 0 };
     std::atomic<int> advancedInterpolationSampleCount{ 0 };
 
-    std::atomic<float> adaptiveInterpolationRate{ 1.0f };
-    std::atomic<float> currentMovementSpeed{ 0.0f };
-    std::atomic<bool> useVelocityBasedInterpolation{ true };
-    std::atomic<bool> usePredictiveInterpolation{ true };
-
-    enum class InterpolationQuality {
-        LINEAR = 0,
-        CUBIC = 1,
-        BEZIER = 2,
-        ADAPTIVE = 3
-    };
-    InterpolationQuality interpolationQuality = InterpolationQuality::ADAPTIVE;
-
     bool hasSSE, hasSSE2, hasAVX;
 
-    alignas(16) float rotationCos[4];
-    alignas(16) float rotationSin[4];
-
-    std::atomic<double> tabletFrequency{ 0.0 };
-    std::atomic<double> programFrequency{ 0.0 };
-    std::atomic<double> cursorUpdateFrequency{ 0.0 };
-    std::deque<std::chrono::high_resolution_clock::time_point> tabletUpdateTimes;
-    std::deque<std::chrono::high_resolution_clock::time_point> programUpdateTimes;
-    std::deque<std::chrono::high_resolution_clock::time_point> cursorUpdateTimes;
-    std::mutex frequencyMutex;
-
-    enum class LoggingMode {
-        OFF = 0,
-        FREQUENCY = 1,
-        PREDICTION = 2,
-        POSITION = 3
-    };
-
-    LoggingMode currentLoggingMode = LoggingMode::OFF;
     HANDLE consoleHandle;
     COORD loggingLinePos;
 
@@ -345,10 +1088,6 @@ private:
     std::thread configThread;
     std::thread loggingThread;
 
-    std::atomic<TabletData*> latestData{ nullptr };
-    alignas(16) TabletData dataBuffer[2];
-    std::atomic<int> currentBuffer{ 0 };
-
     std::vector<Monitor> monitors;
     int SCREEN_WIDTH = GetSystemMetrics(SM_CXSCREEN);
     int SCREEN_HEIGHT = GetSystemMetrics(SM_CYSCREEN);
@@ -372,6 +1111,138 @@ private:
         {15200, 9500, 152, 95, TabletType::WACOM_CTL472, "Wacom CTL-472"}
     };
 
+
+    __forceinline bool ParseTabletDataZeroCopy(BYTE* buffer, DWORD length, TabletData& data) {
+        data.timestamp = std::chrono::high_resolution_clock::now();
+        data.inProximity = false;
+        data.isTouching = false;
+        data.rawPos = Vec2i(0, 0);
+        data.isValid = false;
+
+        int rawX, rawY;
+        switch (currentTablet.type) {
+        case TabletType::WACOM_CTL672:
+            if (!ParseWacomDataZeroCopy(buffer, length, rawX, rawY, data.inProximity, data.isTouching)) return false;
+            break;
+        case TabletType::WACOM_CTL472:
+            if (!ParseWacomCTL472DataZeroCopy(buffer, length, rawX, rawY, data.inProximity, data.isTouching)) return false;
+            break;
+        case TabletType::XPPEN_STAR_G640:
+            if (!ParseXPPenDataZeroCopy(buffer, length, rawX, rawY, data.inProximity, data.isTouching)) return false;
+            break;
+        default:
+            return false;
+        }
+
+        data.rawPos = Vec2i(rawX, rawY);
+        data.isValid = IsValidTabletDataFast(data.rawPos, data.inProximity);
+        return data.isValid;
+    }
+
+    __forceinline void UpdateFastAccessDataZeroCopy(const TabletData& data) {
+
+        memcpy(&fastAccessData, &data, sizeof(TabletData));
+        _mm_sfence();
+        fastDataValid = true;
+    }
+
+    void ProcessBatchedReports() {
+        TabletData batchData[BATCH_BUFFER_SIZE];
+        size_t count = 0;
+
+
+        while (count < BATCH_BUFFER_SIZE && batchBuffer.TryPop(batchData[count])) {
+            count++;
+        }
+
+
+        for (size_t i = 0; i < count; i++) {
+            if (batchData[i].isValid) {
+                tabletDataBuffer.TryPush(batchData[i]);
+            }
+        }
+    }
+
+    void ProcessTabletDataBatch(TabletData* batch, size_t count) {
+
+        for (size_t i = 0; i < count; i++) {
+            if (batch[i].isValid) {
+                tabletDataBuffer.TryPush(batch[i]);
+            }
+        }
+    }
+
+    Vec2f CalculateScreenPositionFast(const TabletData& data) {
+
+        float normalizedX = (data.rawPos.x - tabletLookup.centerOffsetX) * tabletLookup.scaleX;
+        float normalizedY = (data.rawPos.y - tabletLookup.centerOffsetY) * tabletLookup.scaleY;
+
+
+        if (normalizedX < 0.0f || normalizedX > 1.0f || normalizedY < 0.0f || normalizedY > 1.0f) {
+            return Vec2f(-1.0f, -1.0f);
+        }
+
+        const Monitor& monitor = monitors[config.currentMonitor];
+        return Vec2f(
+            monitor.x + normalizedX * monitor.width,
+            monitor.y + normalizedY * monitor.height
+        );
+    }
+
+    __forceinline bool IsValidTabletDataFast(const Vec2i& rawPos, bool inProximity) {
+
+        return rawPos.x >= 0 && rawPos.y >= 0 &&
+            rawPos.x <= tabletLookup.maxX && rawPos.y <= tabletLookup.maxY &&
+            !(rawPos.x == 0 && rawPos.y == 0 && !inProximity);
+    }
+
+
+    __forceinline bool ParseWacomDataZeroCopy(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
+        if (length < 8) return false;
+
+        if (data[0] == 0x01) {
+            rawX = data[2] | (data[3] << 8);
+            rawY = data[4] | (data[5] << 8);
+            inProximity = (data[1] & 0x01) != 0;
+            isTouching = (data[1] & 0x02) != 0;
+            return true;
+        }
+        else if (data[0] == 0x02) {
+            rawX = data[2] | (data[3] << 8);
+            rawY = data[4] | (data[5] << 8);
+            inProximity = (data[1] & 0x20) != 0;
+            isTouching = (data[1] & 0x01) != 0;
+            return true;
+        }
+        return false;
+    }
+
+    __forceinline bool ParseWacomCTL472DataZeroCopy(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
+        if (length < 10) return false;
+
+        if (data[0] == 0x01 || data[0] == 0x02) {
+            rawX = data[2] | (data[3] << 8);
+            rawY = data[4] | (data[5] << 8);
+            inProximity = (data[1] & 0x20) != 0;
+            isTouching = (data[1] & 0x01) != 0;
+            return true;
+        }
+        return false;
+    }
+
+    __forceinline bool ParseXPPenDataZeroCopy(BYTE* data, DWORD length, int& rawX, int& rawY, bool& inProximity, bool& isTouching) {
+        if (length < 14) return false;
+
+        if (data[0] == 0x02 && (data[1] == 0xA0 || data[1] == 0xA1)) {
+            rawX = data[2] | (data[3] << 8);
+            rawY = data[4] | (data[5] << 8);
+            inProximity = true;
+            isTouching = (data[1] == 0xA1);
+            return true;
+        }
+        return false;
+    }
+
 public:
     HighPerformanceTabletDriver() : deviceHandle(INVALID_HANDLE_VALUE) {
         hasSSE = SIMDMath::HasSSE();
@@ -382,10 +1253,7 @@ public:
             << ", SSE2=" << (hasSSE2 ? "YES" : "NO")
             << ", AVX=" << (hasAVX ? "YES" : "NO") << std::endl;
 
-        rotationCos[0] = 1.0f; rotationSin[0] = 0.0f;
-        rotationCos[1] = 0.0f; rotationSin[1] = 1.0f;
-        rotationCos[2] = -1.0f; rotationSin[2] = 0.0f;
-        rotationCos[3] = 0.0f; rotationSin[3] = -1.0f;
+        InitializeCPUAffinity();
 
         currentTablet = TABLET_SPECS[0];
         DetectMonitors();
@@ -394,24 +1262,69 @@ public:
         consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
         loggingLinePos = { 0, 0 };
 
-        memset(&dataBuffer[0], 0, sizeof(TabletData));
-        memset(&dataBuffer[1], 0, sizeof(TabletData));
-        dataBuffer[0].isValid = false;
-        dataBuffer[1].isValid = false;
-
         Vec2f zero(0.0f, 0.0f);
         Vec2i zeroI(0, 0);
         currentVelocity.store(zero);
         lastScreenPos.store(zero);
         lastValidRawPos.store(zeroI);
+
+        fastDataValid = false;
+        memset(&fastAccessData, 0, sizeof(TabletData));
+
+        _mm_prefetch(reinterpret_cast<const char*>(&velocityHistory), _MM_HINT_T1);
+        _mm_prefetch(reinterpret_cast<const char*>(&fastAccessData), _MM_HINT_T1);
+        _mm_prefetch(reinterpret_cast<const char*>(&tabletDataBuffer), _MM_HINT_T1);
+
+        memset(workingPositions, 0, sizeof(workingPositions));
+        memset(workingWeights, 0, sizeof(workingWeights));
+        memset(workingTimestamps, 0, sizeof(workingTimestamps));
+    }
+
+    void InitializeTabletLookupTable() {
+        if (currentTablet.type == TabletType::UNKNOWN) return;
+
+        Vec2i areaMin, areaSize;
+        CalculateAreaBounds(areaMin, areaSize);
+
+        tabletLookup.maxX = currentTablet.maxX;
+        tabletLookup.maxY = currentTablet.maxY;
+        tabletLookup.scaleX = 1.0f / areaSize.x;
+        tabletLookup.scaleY = 1.0f / areaSize.y;
+        tabletLookup.centerOffsetX = areaMin.x;
+        tabletLookup.centerOffsetY = areaMin.y;
+
+
+        _mm_prefetch(reinterpret_cast<const char*>(&tabletLookup), _MM_HINT_T0);
     }
 
     ~HighPerformanceTabletDriver() {
         Stop();
+
+        SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+        timeEndPeriod(1);
+
         if (deviceHandle != INVALID_HANDLE_VALUE) {
             CloseHandle(deviceHandle);
             deviceHandle = INVALID_HANDLE_VALUE;
         }
+    }
+
+    void InitializeCPUAffinity() {
+
+        GetProcessAffinityMask(GetCurrentProcess(), &processAffinityMask, &systemAffinityMask);
+
+
+        availableCores.clear();
+        for (int i = 0; i < 64; i++) {
+            if (processAffinityMask & (1ULL << i)) {
+                availableCores.push_back(i);
+            }
+        }
+
+        std::cout << "Available CPU cores: " << availableCores.size() << std::endl;
+
+
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     }
 
     static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData) {
@@ -565,6 +1478,9 @@ public:
                                 SetDefaultArea();
                             }
 
+                            OptimizeSystemForTablet();
+                            InitializeTabletLookupTable();
+
                             free(deviceInterfaceDetailData);
                             SetupDiDestroyDeviceInfoList(deviceInfoSet);
                             return true;
@@ -582,88 +1498,45 @@ public:
 
 private:
     void SetThreadSafePriority() {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
 
-    void UpdateTabletFrequency() {
-        auto currentTime = std::chrono::high_resolution_clock::now();
+    void SetOptimalThreadAffinity(int threadType) {
+        if (availableCores.size() < 2) return;
 
-        std::lock_guard<std::mutex> lock(frequencyMutex);
+        DWORD_PTR affinityMask = 0;
 
-        tabletUpdateTimes.push_back(currentTime);
-        auto oneSecondAgo = currentTime - std::chrono::seconds(1);
-        while (!tabletUpdateTimes.empty() && tabletUpdateTimes.front() < oneSecondAgo) {
-            tabletUpdateTimes.pop_front();
-        }
-        tabletFrequency.store(static_cast<double>(tabletUpdateTimes.size()));
-    }
+        switch (threadType) {
+        case 0:
+            if (availableCores.size() > 0) {
+                affinityMask = 1ULL << availableCores[0];
+            }
+            break;
 
-    void UpdateProgramFrequency() {
-        auto currentTime = std::chrono::high_resolution_clock::now();
+        case 1:
+            if (availableCores.size() > 1) {
+                affinityMask = 1ULL << availableCores[1];
+            }
+            else if (availableCores.size() > 0) {
+                affinityMask = 1ULL << availableCores[0];
+            }
+            break;
 
-        std::lock_guard<std::mutex> lock(frequencyMutex);
-
-        programUpdateTimes.push_back(currentTime);
-        auto oneSecondAgo = currentTime - std::chrono::seconds(1);
-        while (!programUpdateTimes.empty() && programUpdateTimes.front() < oneSecondAgo) {
-            programUpdateTimes.pop_front();
-        }
-        programFrequency.store(static_cast<double>(programUpdateTimes.size()));
-    }
-
-    void UpdateCursorFrequency() {
-        auto currentTime = std::chrono::high_resolution_clock::now();
-
-        std::lock_guard<std::mutex> lock(frequencyMutex);
-
-        cursorUpdateTimes.push_back(currentTime);
-        auto oneSecondAgo = currentTime - std::chrono::seconds(1);
-        while (!cursorUpdateTimes.empty() && cursorUpdateTimes.front() < oneSecondAgo) {
-            cursorUpdateTimes.pop_front();
-        }
-        cursorUpdateFrequency.store(static_cast<double>(cursorUpdateTimes.size()));
-    }
-
-    void UpdateLoggingDisplay() {
-        if (currentLoggingMode == LoggingMode::OFF || !running) return;
-
-        CONSOLE_SCREEN_BUFFER_INFO csbi;
-        if (!GetConsoleScreenBufferInfo(consoleHandle, &csbi)) return;
-        COORD savedPos = csbi.dwCursorPosition;
-
-        SetConsoleCursorPosition(consoleHandle, loggingLinePos);
-
-        switch (currentLoggingMode) {
-        case LoggingMode::FREQUENCY: {
-            double tFreq = tabletFrequency.load();
-            double pFreq = programFrequency.load();
-            double cFreq = cursorUpdateFrequency.load();
-            std::cout << "Tablet: " << (int)tFreq << " Hz | Program: " << (int)pFreq
-                << " Hz | Cursor: " << (int)cFreq << " Hz                                           ";
+        case 2:
+            if (availableCores.size() > 2) {
+                affinityMask = 1ULL << availableCores[2];
+            }
+            else if (availableCores.size() > 0) {
+                affinityMask = 1ULL << availableCores[availableCores.size() - 1];
+            }
             break;
         }
-        case LoggingMode::PREDICTION: {
-            Vec2f vel = currentVelocity.load();
-            double predAmount = predictionAmount.load();
-            double totalVelocity = SIMDMath::Length(vel);
-            std::cout << "Velocity: " << (int)totalVelocity << " px/frame | VelX: " << (int)vel.x
-                << " | VelY: " << (int)vel.y << " | Prediction: " << (int)predAmount << " px           ";
-            break;
-        }
-        case LoggingMode::POSITION: {
-            int tabX = currentTabletX.load();
-            int tabY = currentTabletY.load();
-            int scrX = currentScreenX.load();
-            int scrY = currentScreenY.load();
-            bool clicking = isCurrentlyClicking.load();
-            std::cout << "Tablet: (" << tabX << "," << tabY << ") | Screen: (" << scrX << "," << scrY
-                << ") | Click: " << (clicking ? "YES" : "NO") << "               ";
-            break;
-        }
+
+        if (affinityMask != 0) {
+            SetThreadAffinityMask(GetCurrentThread(), affinityMask);
         }
 
-        SetConsoleCursorPosition(consoleHandle, savedPos);
-        std::cout.flush();
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
 
     TabletType DetectTabletType(USHORT vendorId, USHORT productId) {
@@ -726,90 +1599,6 @@ private:
     }
 
 public:
-    void ShowCurrentSettings() const {
-        system("cls");
-        std::cout << "=== Ultra Tablet Driver v3.1 (stable) - by vilounos ===" << std::endl;
-        std::cout << "Detected Tablet: " << currentTablet.name << std::endl;
-        std::cout << "SIMD Acceleration: " << (hasSSE2 ? "ENABLED" : "DISABLED") << std::endl;
-
-        if (monitors.size() > 1) {
-            std::cout << "Current Monitor: " << (config.currentMonitor + 1) << "/" << monitors.size()
-                << " (" << monitors[config.currentMonitor].name << ") - "
-                << monitors[config.currentMonitor].width << "x" << monitors[config.currentMonitor].height << std::endl;
-        }
-        else {
-            std::cout << "Monitor Resolution: " << monitors[0].width << "x" << monitors[0].height << std::endl;
-        }
-
-        std::cout << "Tablet Size: " << currentTablet.widthMM << "x" << currentTablet.heightMM << "mm" << std::endl;
-        std::cout << "Max Resolution: " << currentTablet.maxX << "x" << currentTablet.maxY << std::endl;
-        std::cout << std::endl;
-
-        switch (config.rotation) {
-        case 0: std::cout << "Active Area Size: " << config.areaWidth << "x" << config.areaHeight << "mm" << std::endl; break;
-        case 1: std::cout << "Active Area Size: " << config.areaHeight << "x" << config.areaWidth << "mm" << std::endl; break;
-        case 2: std::cout << "Active Area Size: " << config.areaWidth << "x" << config.areaHeight << "mm" << std::endl; break;
-        case 3: std::cout << "Active Area Size: " << config.areaHeight << "x" << config.areaWidth << "mm" << std::endl; break;
-        }
-
-        std::cout << "Area Center: (" << config.areaCenterX << "," << config.areaCenterY << ")mm" << std::endl;
-        std::cout << "Rotation: ";
-        switch (config.rotation) {
-        case 0: std::cout << "None (0 degrees)"; break;
-        case 1: std::cout << "Left (90 degrees CCW)"; break;
-        case 2: std::cout << "Flip (180 degrees)"; break;
-        case 3: std::cout << "Right (270 degrees CCW)"; break;
-        }
-        std::cout << std::endl;
-        std::cout << "Movement Prediction: " << (config.movementPrediction ? "ON" : "OFF");
-        if (config.movementPrediction) {
-            std::cout << " (Strength: " << config.predictionStrength << ")";
-        }
-        std::cout << std::endl;
-
-        std::cout << "Movement Interpolation: " << (interpolationEnabled ? "ON" : "OFF");
-        if (interpolationEnabled) {
-            std::cout << " (Multiplier: " << interpolationMultiplier << "x)";
-        }
-        std::cout << std::endl;
-
-        std::cout << "Click Simulation: " << (config.clickEnabled ? "ON" : "OFF") << std::endl;
-
-        std::cout << "Logging Mode: ";
-        switch (currentLoggingMode) {
-        case LoggingMode::OFF: std::cout << "OFF"; break;
-        case LoggingMode::FREQUENCY: std::cout << "FREQUENCY"; break;
-        case LoggingMode::PREDICTION: std::cout << "PREDICTION"; break;
-        case LoggingMode::POSITION: std::cout << "POSITION"; break;
-        }
-        std::cout << std::endl;
-
-        CONSOLE_SCREEN_BUFFER_INFO csbi;
-        if (GetConsoleScreenBufferInfo(consoleHandle, &csbi)) {
-            const_cast<HighPerformanceTabletDriver*>(this)->loggingLinePos = csbi.dwCursorPosition;
-        }
-
-        std::cout << std::endl;
-        std::cout << "Controls:" << std::endl;
-        std::cout << "Arrow keys: Move area center" << std::endl;
-        std::cout << "2,4,6,8: Adjust area size (width/height)" << std::endl;
-        std::cout << "R: Change rotation" << std::endl;
-        std::cout << "P: Toggle movement prediction" << std::endl;
-        std::cout << "C: Toggle click simulation" << std::endl;
-        std::cout << "+/-: Adjust prediction strength" << std::endl;
-        std::cout << "I: Toggle interpolation" << std::endl;
-        std::cout << "[/]: Adjust interpolation multiplier" << std::endl;
-        if (monitors.size() > 1) {
-            std::cout << "M: Switch monitor" << std::endl;
-        }
-        std::cout << "S: Start/Stop driver" << std::endl;
-        std::cout << "Q: Quit" << std::endl;
-        std::cout << "L: Cycle logging mode (OFF->FREQ->PRED->POS)" << std::endl;
-        if (running) {
-            std::cout << std::endl << "Driver is running... ESC to restart driver." << std::endl;
-        }
-    }
-
     void MoveAreaCenter(int deltaX, int deltaY) {
         config.areaCenterX += deltaX;
         config.areaCenterY += deltaY;
@@ -840,16 +1629,6 @@ public:
         }
     }
 
-    void CycleLoggingMode() {
-        currentLoggingMode = static_cast<LoggingMode>((static_cast<int>(currentLoggingMode) + 1) % 4);
-
-        if (currentLoggingMode != LoggingMode::OFF) {
-            if (running && !loggingThread.joinable()) {
-                loggingThread = std::thread(&HighPerformanceTabletDriver::LoggingUpdateLoop, this);
-            }
-        }
-    }
-
     void TogglePrediction() {
         config.movementPrediction = !config.movementPrediction;
         SaveConfig();
@@ -874,51 +1653,58 @@ public:
     }
 
     void RunConfiguration() {
+
+        HWND consoleWindow = GetConsoleWindow();
+        if (consoleWindow) {
+            ShowWindow(consoleWindow, SW_HIDE);
+        }
+
         configMode = true;
-        ShowCurrentSettings();
+        guiRunning = true;
 
-        configThread = std::thread([this]() {
-            SetThreadSafePriority();
 
-            while (configMode && !emergencyShutdown) {
-                if (_kbhit()) {
-                    char key = _getch();
+        GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
 
-                    if (key == -32 || key == 0) {
-                        key = _getch();
-                        switch (key) {
-                        case 72: MoveAreaCenter(0, -1); ShowCurrentSettings(); break;
-                        case 80: MoveAreaCenter(0, 1); ShowCurrentSettings(); break;
-                        case 75: MoveAreaCenter(-1, 0); ShowCurrentSettings(); break;
-                        case 77: MoveAreaCenter(1, 0); ShowCurrentSettings(); break;
-                        }
-                    }
-                    else {
-                        switch (key) {
-                        case '2': AdjustAreaSize(0, -1); ShowCurrentSettings(); break;
-                        case '4': AdjustAreaSize(-1, 0); ShowCurrentSettings(); break;
-                        case '6': AdjustAreaSize(1, 0); ShowCurrentSettings(); break;
-                        case '8': AdjustAreaSize(0, 1); ShowCurrentSettings(); break;
-                        case 'r': case 'R': ConfigureRotation(); ShowCurrentSettings(); break;
-                        case 'm': case 'M': SwitchMonitor(); ShowCurrentSettings(); break;
-                        case 'p': case 'P': TogglePrediction(); ShowCurrentSettings(); break;
-                        case 'c': case 'C': ToggleClick(); ShowCurrentSettings(); break;
-                        case '+': case '=': AdjustPredictionStrength(1); ShowCurrentSettings(); break;
-                        case '-': case '_': AdjustPredictionStrength(-1); ShowCurrentSettings(); break;
-                        case 's': case 'S':
-                            if (running) Stop(); else Start();
-                            ShowCurrentSettings(); break;
-                        case 'q': case 'Q': configMode = false; Stop(); break;
-                        case 'l': case 'L': CycleLoggingMode(); ShowCurrentSettings(); break;
-                        case 27: if (running) { RestartDriver(); ShowCurrentSettings(); } break;
-                        case 'i': case 'I': ToggleInterpolation(); ShowCurrentSettings(); break;
-                        case '[': AdjustInterpolationMultiplier(-1); ShowCurrentSettings(); break;
-                        case ']': AdjustInterpolationMultiplier(1); ShowCurrentSettings(); break;
-                        }
-                    }
-                }
-            }
-            });
+
+        SetOptimalThreadAffinity(2);
+
+
+        WNDCLASS wc = {};
+        wc.lpfnWndProc = WindowProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.lpszClassName = L"UltraTabletDriverGUI";
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        RegisterClass(&wc);
+
+
+        mainWindow = CreateWindow(
+            L"UltraTabletDriverGUI",
+            L"Ultra Tablet Driver v4.0 - GUI",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            CW_USEDEFAULT, CW_USEDEFAULT, 520, 650,
+            nullptr, nullptr, GetModuleHandle(nullptr), this
+        );
+
+        if (!mainWindow) return;
+
+        ShowWindow(mainWindow, SW_SHOW);
+        UpdateWindow(mainWindow);
+
+
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0) && guiRunning) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        configMode = false;
+        guiRunning = false;
+
+        if (guiThread.joinable()) {
+            guiThread.join();
+        }
     }
 
     void Start() {
@@ -938,29 +1724,16 @@ public:
         Vec2i zeroPos(-1, -1);
         lastValidRawPos.store(zeroPos);
 
-        {
-            std::lock_guard<std::mutex> lock(frequencyMutex);
-            tabletUpdateTimes.clear();
-            programUpdateTimes.clear();
-            cursorUpdateTimes.clear();
-            tabletFrequency = 0.0;
-            programFrequency = 0.0;
-            cursorUpdateFrequency = 0.0;
-        }
-
         ClearInterpolationBuffer();
 
         inputThread = std::thread(&HighPerformanceTabletDriver::SafeInputLoop, this);
         processingThread = std::thread(&HighPerformanceTabletDriver::SafeProcessingLoop, this);
-
-        if (currentLoggingMode != LoggingMode::OFF) {
-            loggingThread = std::thread(&HighPerformanceTabletDriver::LoggingUpdateLoop, this);
-        }
     }
 
     void Stop() {
         emergencyShutdown = true;
         running = false;
+        guiRunning = false;
 
         if (currentlyPressed && config.clickEnabled) {
             INPUT input = {};
@@ -983,7 +1756,7 @@ public:
 
 private:
     void SafeInputLoop() {
-        SetThreadSafePriority();
+        SetOptimalThreadAffinity(0);
 
         BYTE buffer[64];
         DWORD bytesRead;
@@ -1002,49 +1775,63 @@ private:
     }
 
     void SafeProcessingLoop() {
-        SetThreadSafePriority();
+        SetOptimalThreadAffinity(1);
 
-        TabletData* lastProcessedData = nullptr;
+
+        TabletData localData;
+        Vec2f baseScreenPos, finalScreenPos;
 
         while (running && !emergencyShutdown) {
             try {
-                TabletData* currentData = latestData.load();
 
-                UpdateProgramFrequency();
 
-                if (currentData != nullptr && currentData != lastProcessedData && currentData->isValid) {
+                if (fastDataValid) {
+                    localData = fastAccessData;
+                    _mm_lfence();
 
-                    Vec2f baseScreenPos;
-                    if (!CalculateScreenPosition(*currentData, baseScreenPos)) {
-                        lastProcessedData = currentData;
-                        continue;
-                    }
+                    if (localData.isValid) {
+                        if (CalculateScreenPosition(localData, baseScreenPos)) {
+                            ApplyPrediction(baseScreenPos, finalScreenPos, localData.timestamp);
 
-                    Vec2f finalScreenPos;
-                    ApplyPrediction(baseScreenPos, finalScreenPos, currentData->timestamp);
+                            if (interpolationEnabled && hasLastPosition.load()) {
+                                ProcessInterpolatedMovement(finalScreenPos);
+                            }
+                            else {
+                                MoveCursorToPosition(finalScreenPos);
+                            }
 
-                    if (interpolationEnabled && hasLastPosition.load()) {
-                        Vec2f currentVel = currentVelocity.load();
-                        StoreAdvancedInterpolationSample(finalScreenPos, currentVel, currentData->timestamp);
-
-                        auto interpolatedPositions = GenerateAdvancedInterpolatedPositions();
-
-                        for (const auto& interpPos : interpolatedPositions) {
-                            MoveCursorToPosition(interpPos);
+                            HandleMouseClick(localData.isTouching);
                         }
                     }
-                    else {
-                        if (interpolationEnabled) {
-                            Vec2f currentVel = currentVelocity.load();
-                            StoreAdvancedInterpolationSample(finalScreenPos, currentVel, currentData->timestamp);
-                        }
-                        MoveCursorToPosition(finalScreenPos);
-                    }
-
-                    HandleMouseClick(currentData->isTouching);
-
-                    lastProcessedData = currentData;
+                    fastDataValid = false;
                 }
+
+
+                if (!batchBuffer.IsEmpty()) {
+                    ProcessBatchedReports();
+                }
+                while (tabletDataBuffer.TryPop(localData)) {
+                    if (localData.isValid) {
+                        if (CalculateScreenPosition(localData, baseScreenPos)) {
+                            ApplyPrediction(baseScreenPos, finalScreenPos, localData.timestamp);
+
+                            if (interpolationEnabled && hasLastPosition.load()) {
+                                ProcessInterpolatedMovement(finalScreenPos);
+                            }
+                            else {
+                                MoveCursorToPosition(finalScreenPos);
+                            }
+
+                            HandleMouseClick(localData.isTouching);
+                        }
+                    }
+                }
+
+
+                if (tabletDataBuffer.IsEmpty()) {
+                    _mm_pause();
+                }
+
             }
             catch (...) {
                 emergencyShutdown = true;
@@ -1053,12 +1840,91 @@ private:
         }
     }
 
+    void ProcessInterpolatedMovement(const Vec2f& finalScreenPos) {
+        Vec2f currentVel = currentVelocity.load();
+
+        InterpolationSample sample;
+        sample.screenPos = finalScreenPos;
+        sample.timestamp = std::chrono::high_resolution_clock::now();
+        sample.valid = true;
+
+        interpolationRingBuffer.TryPush(sample);
+
+
+        MoveCursorToPosition(finalScreenPos);
+
+
+        if (hasLastPosition.load()) {
+            std::vector<Vec2f> interpolatedPositions = GenerateOptimizedInterpolatedPositions();
+
+            for (const auto& pos : interpolatedPositions) {
+                MoveCursorToPosition(pos);
+            }
+        }
+    }
+
+    void OptimizeSystemForTablet() {
+
+        timeBeginPeriod(1);
+
+
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_SENDCHANGE);
+
+
+        PROCESS_POWER_THROTTLING_STATE PowerThrottling{};
+        PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        PowerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        PowerThrottling.StateMask = 0;
+
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+            &PowerThrottling, sizeof(PowerThrottling));
+    }
+
+    std::vector<Vec2f> GenerateOptimizedInterpolatedPositions() {
+        std::vector<Vec2f> positions;
+        positions.reserve(interpolationMultiplier);
+
+        if (interpolationRingBuffer.Size() < 2) {
+            return positions;
+        }
+
+        Vec2f lastPos = lastScreenPos.load();
+        lastPos.Prefetch();
+
+        if (hasLastPosition.load()) {
+            Vec2f currentPos = fastAccessData.isValid ?
+                Vec2f((float)currentScreenX.load(), (float)currentScreenY.load()) : lastPos;
+
+            currentPos.Prefetch();
+
+
+            __m128 vlastPos = _mm_set_ps(0.0f, 0.0f, lastPos.y, lastPos.x);
+            __m128 vcurrentPos = _mm_set_ps(0.0f, 0.0f, currentPos.y, currentPos.x);
+            __m128 vdelta = _mm_sub_ps(vcurrentPos, vlastPos);
+
+            for (int i = 1; i < interpolationMultiplier; i++) {
+                float t = (float)i / interpolationMultiplier;
+                __m128 vt = _mm_set1_ps(t);
+                __m128 vinterp = _mm_add_ps(vlastPos, _mm_mul_ps(vdelta, vt));
+
+                float interpData[4];
+                _mm_store_ps(interpData, vinterp);
+
+                positions.emplace_back(interpData[0], interpData[1]);
+            }
+        }
+
+        return positions;
+    }
+
     bool CalculateScreenPosition(const TabletData& data, Vec2f& screenPos) {
         bool wasJustLifted = wasInProximityLast.load() && !data.inProximity;
         wasInProximityLast.store(data.inProximity);
 
         if (!data.inProximity && !data.isTouching) {
             hasLastPosition = false;
+
+            velocityHistory.Clear();
             return false;
         }
 
@@ -1078,18 +1944,18 @@ private:
                 HandleMouseClick(false);
             }
             hasLastPosition = false;
+
+            velocityHistory.Clear();
             return false;
         }
 
         Vec2f normalizedPos = SIMDMath::NormalizeCoords(data.rawPos, areaMin, areaSize);
-
         Vec2f rotatedPos = ApplyRotationToNormalized(normalizedPos, config.rotation);
 
         Vec2i screenSize, screenOffset;
         GetRotatedScreenBounds(currentMonitor, screenSize, screenOffset);
 
         Vec2i screenPosInt = SIMDMath::MapToScreen(rotatedPos, screenSize, screenOffset);
-
         screenPos = Vec2f((float)screenPosInt.x, (float)screenPosInt.y);
 
         return true;
@@ -1124,7 +1990,6 @@ private:
 
     void GetRotatedScreenBounds(const Monitor& monitor, Vec2i& screenSize, Vec2i& screenOffset) {
         screenOffset = Vec2i(monitor.x, monitor.y);
-
         screenSize = Vec2i(monitor.width, monitor.height);
     }
 
@@ -1133,26 +1998,45 @@ private:
 
         finalScreenPos = baseScreenPos;
 
-        bool wasJustLifted = wasInProximityLast.load() && !hasLastPosition.load();
 
-        if (config.movementPrediction && hasLastPosition && !wasJustLifted) {
-            Vec2f lastPos = lastScreenPos.load();
-            Vec2f velocity = SIMDMath::Sub(baseScreenPos, lastPos);
+        UpdateVelocityHistory(baseScreenPos, timestamp);
 
-            currentVelocity.store(velocity);
+        if (config.movementPrediction && hasLastPosition.load()) {
+            Vec2f smoothedVelocity = CalculateSmoothedVelocity();
 
-            float predictionFactor = min(config.predictionStrength * 0.15f, 3.0f);
-            Vec2f prediction = SIMDMath::Scale(velocity, predictionFactor);
 
-            finalScreenPos = SIMDMath::Add(baseScreenPos, prediction);
+            float velocityMagnitude = SIMDMath::Length(smoothedVelocity);
 
-            predictionAmount.store(SIMDMath::Length(prediction));
+
+            if (velocityMagnitude > 50.0f) {
+
+                float predictionTime = 0.012f;
+
+
+                float adaptiveFactor = min(velocityMagnitude / 1000.0f, 1.0f);
+                float finalPredictionTime = predictionTime * adaptiveFactor * (config.predictionStrength * 0.1f);
+
+
+                Vec2f prediction = SIMDMath::Scale(smoothedVelocity, finalPredictionTime);
+                finalScreenPos = SIMDMath::Add(baseScreenPos, prediction);
+
+
+                currentVelocity.store(smoothedVelocity);
+                predictionAmount.store(SIMDMath::Length(prediction));
+            }
+            else {
+
+                Vec2f zeroVel(0.0f, 0.0f);
+                currentVelocity.store(zeroVel);
+                predictionAmount.store(0.0);
+            }
         }
         else {
             Vec2f zeroVel(0.0f, 0.0f);
             currentVelocity.store(zeroVel);
             predictionAmount.store(0.0);
         }
+
 
         const Monitor& currentMonitor = monitors[config.currentMonitor];
 
@@ -1192,8 +2076,6 @@ private:
             input.mi.dy = deltaY;
             SendInput(1, &input, sizeof(INPUT));
 
-            UpdateCursorFrequency();
-
             currentScreenX.store(screenX);
             currentScreenY.store(screenY);
         }
@@ -1217,242 +2099,63 @@ private:
     }
 
     void ClearInterpolationBuffer() {
-        interpolationWriteIndex.store(0);
-        interpolationReadIndex.store(0);
-        interpolationSampleCount.store(0);
 
-        for (int i = 0; i < INTERPOLATION_BUFFER_SIZE; i++) {
-            interpolationBuffer[i].valid = false;
-        }
-    }
-
-    void LoggingUpdateLoop() {
-        SetThreadSafePriority();
-
-        while (running && !emergencyShutdown) {
-            try {
-                UpdateLoggingDisplay();
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-            catch (...) {
-                break;
-            }
-        }
+        interpolationRingBuffer = LockFreeRingBuffer<InterpolationSample, INTERP_BUFFER_SIZE>();
     }
 
     void ProcessRawTabletData(BYTE* buffer, DWORD length) {
         if (length < 6 || buffer == nullptr) return;
 
-        int nextBuffer = 1 - currentBuffer.load();
-        TabletData* data = &dataBuffer[nextBuffer];
-
-        data->timestamp = std::chrono::high_resolution_clock::now();
-        data->inProximity = false;
-        data->isTouching = false;
-        data->rawPos = Vec2i(0, 0);
-        data->isValid = false;
+        TabletData localData;
+        localData.timestamp = std::chrono::high_resolution_clock::now();
+        localData.inProximity = false;
+        localData.isTouching = false;
+        localData.rawPos = Vec2i(0, 0);
+        localData.isValid = false;
 
         try {
             int rawX, rawY;
             switch (currentTablet.type) {
             case TabletType::WACOM_CTL672:
-                ParseWacomData(buffer, length, rawX, rawY, data->inProximity, data->isTouching);
+                ParseWacomData(buffer, length, rawX, rawY, localData.inProximity, localData.isTouching);
                 break;
             case TabletType::WACOM_CTL472:
-                ParseWacomCTL472Data(buffer, length, rawX, rawY, data->inProximity, data->isTouching);
+                ParseWacomCTL472Data(buffer, length, rawX, rawY, localData.inProximity, localData.isTouching);
                 break;
             case TabletType::XPPEN_STAR_G640:
-                ParseXPPenData(buffer, length, rawX, rawY, data->inProximity, data->isTouching);
+                ParseXPPenData(buffer, length, rawX, rawY, localData.inProximity, localData.isTouching);
                 break;
             default:
                 return;
             }
 
-            data->rawPos = Vec2i(rawX, rawY);
+            localData.rawPos = Vec2i(rawX, rawY);
+            localData.rawPos.Prefetch();
+
         }
         catch (...) {
             return;
         }
 
-        if (!IsValidTabletData(data->rawPos, data->inProximity)) {
+        if (!IsValidTabletData(localData.rawPos, localData.inProximity)) {
             return;
         }
 
-        data->isValid = true;
+        localData.isValid = true;
 
-        if (data->inProximity || data->isTouching) {
-            UpdateTabletFrequency();
+        if (localData.inProximity || localData.isTouching) {
 
-            currentBuffer.store(nextBuffer);
-            latestData.store(data);
-        }
-    }
+            fastAccessData = localData;
+            _mm_sfence();
+            fastDataValid = true;
 
-    void StoreAdvancedInterpolationSample(const Vec2f& screenPos, const Vec2f& velocity,
-        std::chrono::high_resolution_clock::time_point timestamp) {
-        int writeIdx = advancedInterpolationWriteIndex.load();
 
-        advancedInterpolationBuffer[writeIdx].screenPos = screenPos;
-        advancedInterpolationBuffer[writeIdx].velocity = velocity;
-        advancedInterpolationBuffer[writeIdx].timestamp = timestamp;
-        advancedInterpolationBuffer[writeIdx].valid = true;
+            if (!batchBuffer.TryPush(localData)) {
 
-        advancedInterpolationWriteIndex.store((writeIdx + 1) % ADVANCED_INTERPOLATION_BUFFER_SIZE);
-
-        int currentCount = advancedInterpolationSampleCount.load();
-        if (currentCount < ADVANCED_INTERPOLATION_BUFFER_SIZE) {
-            advancedInterpolationSampleCount.store(currentCount + 1);
-        }
-    }
-
-    std::vector<Vec2f> GenerateAdvancedInterpolatedPositions() {
-        std::vector<Vec2f> positions;
-
-        int sampleCount = advancedInterpolationSampleCount.load();
-        if (sampleCount < 2) {
-            return positions;
-        }
-
-        std::vector<AdvancedInterpolationSample> recentSamples;
-        int writeIdx = advancedInterpolationWriteIndex.load();
-
-        for (int i = min(sampleCount, 8); i > 0; i--) {
-            int idx = (writeIdx - i + ADVANCED_INTERPOLATION_BUFFER_SIZE) % ADVANCED_INTERPOLATION_BUFFER_SIZE;
-            if (advancedInterpolationBuffer[idx].valid) {
-                recentSamples.push_back(advancedInterpolationBuffer[idx]);
+                ProcessBatchedReports();
+                tabletDataBuffer.TryPush(localData);
             }
         }
-
-        if (recentSamples.size() < 2) return positions;
-
-        float avgSpeed = CalculateAverageSpeed(recentSamples);
-        float acceleration = CalculateAcceleration(recentSamples);
-        bool isRapidMovement = avgSpeed > 100.0f;
-        bool isDecelerating = acceleration < -10.0f;
-
-        currentMovementSpeed.store(avgSpeed);
-
-        int steps = interpolationMultiplier;
-        if (useVelocityBasedInterpolation.load()) {
-            if (isRapidMovement) {
-                steps = min(steps * 2, 8);
-            }
-            else if (avgSpeed < 20.0f) {
-                steps = max(steps / 2, 1);
-            }
-        }
-
-        const auto& startSample = recentSamples[recentSamples.size() - 2];
-        const auto& endSample = recentSamples[recentSamples.size() - 1];
-
-        switch (interpolationQuality) {
-        case InterpolationQuality::LINEAR:
-            positions = GenerateLinearInterpolation(startSample, endSample, steps);
-            break;
-
-        case InterpolationQuality::CUBIC:
-            if (recentSamples.size() >= 4) {
-                positions = GenerateCubicInterpolation(recentSamples, steps);
-            }
-            else {
-                positions = GenerateLinearInterpolation(startSample, endSample, steps);
-            }
-            break;
-
-        case InterpolationQuality::BEZIER:
-            positions = GenerateBezierInterpolation(startSample, endSample, steps);
-            break;
-
-        case InterpolationQuality::ADAPTIVE:
-        default:
-            if (isRapidMovement && recentSamples.size() >= 4) {
-                positions = GenerateCubicInterpolation(recentSamples, steps);
-            }
-            else if (isDecelerating) {
-                positions = GenerateBezierInterpolation(startSample, endSample, steps);
-            }
-            else {
-                positions = GenerateLinearInterpolation(startSample, endSample, steps);
-            }
-            break;
-        }
-
-        if (usePredictiveInterpolation.load() && !positions.empty()) {
-            ApplyPredictiveSmoothing(positions, endSample.velocity);
-        }
-
-        return positions;
-    }
-
-    float CalculateAverageSpeed(const std::vector<AdvancedInterpolationSample>& samples) {
-        if (samples.size() < 2) return 0.0f;
-
-        float totalSpeed = 0.0f;
-        for (size_t i = 1; i < samples.size(); i++) {
-            float speed = SIMDMath::Length(SIMDMath::Sub(samples[i].screenPos, samples[i - 1].screenPos));
-            totalSpeed += speed;
-        }
-        return totalSpeed / (samples.size() - 1);
-    }
-
-    float CalculateAcceleration(const std::vector<AdvancedInterpolationSample>& samples) {
-        if (samples.size() < 3) return 0.0f;
-
-        Vec2f vel1 = SIMDMath::Sub(samples[samples.size() - 2].screenPos, samples[samples.size() - 3].screenPos);
-        Vec2f vel2 = SIMDMath::Sub(samples[samples.size() - 1].screenPos, samples[samples.size() - 2].screenPos);
-
-        float speed1 = SIMDMath::Length(vel1);
-        float speed2 = SIMDMath::Length(vel2);
-
-        return speed2 - speed1;
-    }
-
-    std::vector<Vec2f> GenerateLinearInterpolation(const AdvancedInterpolationSample& start,
-        const AdvancedInterpolationSample& end, int steps) {
-        std::vector<Vec2f> positions;
-
-        for (int i = 1; i <= steps; i++) {
-            float t = (float)i / (steps + 1);
-            Vec2f interpPos = SIMDMath::Lerp(start.screenPos, end.screenPos, t);
-            positions.push_back(interpPos);
-        }
-
-        return positions;
-    }
-
-    std::vector<Vec2f> GenerateCubicInterpolation(const std::vector<AdvancedInterpolationSample>& samples, int steps) {
-        std::vector<Vec2f> positions;
-
-        if (samples.size() < 4) return positions;
-
-        const auto& p0 = samples[samples.size() - 4].screenPos;
-        const auto& p1 = samples[samples.size() - 3].screenPos;
-        const auto& p2 = samples[samples.size() - 2].screenPos;
-        const auto& p3 = samples[samples.size() - 1].screenPos;
-
-        for (int i = 1; i <= steps; i++) {
-            float t = (float)i / (steps + 1);
-            Vec2f interpPos = SIMDMath::CubicInterpolate(p0, p1, p2, p3, t);
-            positions.push_back(interpPos);
-        }
-
-        return positions;
-    }
-
-    std::vector<Vec2f> GenerateBezierInterpolation(const AdvancedInterpolationSample& start,
-        const AdvancedInterpolationSample& end, int steps) {
-        std::vector<Vec2f> positions;
-
-        Vec2f controlPoint1 = SIMDMath::Add(start.screenPos, SIMDMath::Scale(start.velocity, 0.3f));
-        Vec2f controlPoint2 = SIMDMath::Sub(end.screenPos, SIMDMath::Scale(end.velocity, 0.3f));
-
-        for (int i = 1; i <= steps; i++) {
-            float t = (float)i / (steps + 1);
-            Vec2f interpPos = CubicBezier(start.screenPos, controlPoint1, controlPoint2, end.screenPos, t);
-            positions.push_back(interpPos);
-        }
-
-        return positions;
     }
 
     Vec2f CubicBezier(const Vec2f& p0, const Vec2f& p1, const Vec2f& p2, const Vec2f& p3, float t) {
@@ -1468,19 +2171,6 @@ private:
         result = SIMDMath::Add(result, SIMDMath::Scale(p3, ttt));
 
         return result;
-    }
-
-    void ApplyPredictiveSmoothing(std::vector<Vec2f>& positions, const Vec2f& velocity) {
-        if (positions.empty()) return;
-
-        float velocityMagnitude = SIMDMath::Length(velocity);
-        if (velocityMagnitude < 3.0f) return;
-
-        for (size_t i = positions.size() / 2; i < positions.size(); i++) {
-            float predictionFactor = 0.1f * (float)(i - positions.size() / 2) / (positions.size() / 2);
-            Vec2f prediction = SIMDMath::Scale(velocity, predictionFactor);
-            positions[i] = SIMDMath::Add(positions[i], prediction);
-        }
     }
 
     bool IsValidTabletData(const Vec2i& rawPos, bool inProximity) {
@@ -1558,10 +2248,22 @@ private:
             config.areaCenterY * currentTablet.maxY / currentTablet.heightMM
         );
 
-        Vec2i halfSize(
-            (config.areaWidth * currentTablet.maxX / currentTablet.widthMM) / 2,
-            (config.areaHeight * currentTablet.maxY / currentTablet.heightMM) / 2
-        );
+        Vec2i halfSize;
+
+
+        if (config.rotation == 0 || config.rotation == 2) {
+            halfSize = Vec2i(
+                (config.areaHeight * currentTablet.maxX / currentTablet.widthMM) / 2,
+                (config.areaWidth * currentTablet.maxY / currentTablet.heightMM) / 2
+            );
+        }
+        else {
+
+            halfSize = Vec2i(
+                (config.areaWidth * currentTablet.maxX / currentTablet.widthMM) / 2,
+                (config.areaHeight * currentTablet.maxY / currentTablet.heightMM) / 2
+            );
+        }
 
         areaMin = Vec2i(center.x - halfSize.x, center.y - halfSize.y);
         areaSize = Vec2i(halfSize.x * 2, halfSize.y * 2);
@@ -1709,8 +2411,12 @@ public:
     }
 };
 
+HighPerformancePool<TabletData, 128> HighPerformanceTabletDriver::tabletPool;
+HighPerformancePool<InterpolationSample, 256> HighPerformanceTabletDriver::interpolationPool;
+
+
 int main() {
-    std::cout << "Ultra Tablet Driver v3.1 (stable) - by vilounos" << std::endl;
+    std::cout << "Ultra Tablet Driver v4.0 (stable) - by vilounos" << std::endl;
     std::cout << "Added SIMD Acceleration" << std::endl;
     std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G640" << std::endl << std::endl;
 
