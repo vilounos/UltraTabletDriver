@@ -23,7 +23,6 @@
 #include <commctrl.h>
 #include <gdiplus.h>
 
-
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "hid.lib")
@@ -185,40 +184,6 @@ public:
         result.y = (int)(normalized.y * screenSize.y) + screenOffset.y;
         return result;
     }
-
-    static Vec2f CubicInterpolate(const Vec2f& p0, const Vec2f& p1, const Vec2f& p2, const Vec2f& p3, float t) {
-        __m128 vp0 = _mm_load_ps(reinterpret_cast<const float*>(&p0));
-        __m128 vp1 = _mm_load_ps(reinterpret_cast<const float*>(&p1));
-        __m128 vp2 = _mm_load_ps(reinterpret_cast<const float*>(&p2));
-        __m128 vp3 = _mm_load_ps(reinterpret_cast<const float*>(&p3));
-
-        __m128 vt = _mm_set1_ps(t);
-        __m128 vt2 = _mm_mul_ps(vt, vt);
-        __m128 vt3 = _mm_mul_ps(vt2, vt);
-
-        __m128 a = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(-0.5f), vp0),
-            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.5f), vp1),
-                _mm_add_ps(_mm_mul_ps(_mm_set1_ps(-1.5f), vp2),
-                    _mm_mul_ps(_mm_set1_ps(0.5f), vp3))));
-
-        __m128 b = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(1.0f), vp0),
-            _mm_add_ps(_mm_mul_ps(_mm_set1_ps(-2.5f), vp1),
-                _mm_add_ps(_mm_mul_ps(_mm_set1_ps(2.0f), vp2),
-                    _mm_mul_ps(_mm_set1_ps(-0.5f), vp3))));
-
-        __m128 c = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(-0.5f), vp0),
-            _mm_mul_ps(_mm_set1_ps(0.5f), vp2));
-
-        __m128 d = vp1;
-
-        __m128 result = _mm_add_ps(_mm_mul_ps(a, vt3),
-            _mm_add_ps(_mm_mul_ps(b, vt2),
-                _mm_add_ps(_mm_mul_ps(c, vt), d)));
-
-        Vec2f output;
-        _mm_store_ps(reinterpret_cast<float*>(&output), result);
-        return output;
-    }
 };
 
 enum class TabletType {
@@ -243,18 +208,6 @@ struct Monitor {
     bool isPrimary;
 };
 
-struct alignas(16) InterpolationSample {
-    Vec2f screenPos;
-    std::chrono::high_resolution_clock::time_point timestamp;
-    bool valid;
-    float _pad;
-};
-
-
-static const int INTERPOLATION_BUFFER_SIZE = 16;
-
-bool interpolationEnabled = true;
-int interpolationMultiplier = 2;
 template<typename T, size_t Size>
 class alignas(64) LockFreeRingBuffer {
 
@@ -324,7 +277,11 @@ struct DriverConfig {
     int predictionStrength = 2;
     bool clickEnabled = false;
     int currentMonitor = 0;
+
+    bool smoothingEnabled = false;
+    int smoothingStrength = 5;
 };
+
 
 struct alignas(16) TabletData {
     Vec2i rawPos;
@@ -539,9 +496,10 @@ struct alignas(64) VelocityHistorySOA {
 
 class HighPerformanceTabletDriver {
 private:
-
+    alignas(16) std::atomic<Vec2i> smoothedRawPos;
+    std::atomic<bool> hasSmoothedData{ false };
+    static constexpr float SMOOTHING_THRESHOLD_BASE = 2.0f;
     static HighPerformancePool<TabletData, 128> tabletPool;
-    static HighPerformancePool<InterpolationSample, 256> interpolationPool;
 
 
     static constexpr size_t BATCH_BUFFER_SIZE = 8;
@@ -576,13 +534,8 @@ private:
     static constexpr size_t TABLET_BUFFER_SIZE = 32;
     LockFreeRingBuffer<TabletData, TABLET_BUFFER_SIZE> tabletDataBuffer;
 
-
     alignas(64) TabletData fastAccessData;
     volatile bool fastDataValid = false;
-
-private:
-    static constexpr size_t INTERP_BUFFER_SIZE = 64;
-    LockFreeRingBuffer<InterpolationSample, INTERP_BUFFER_SIZE> interpolationRingBuffer;
 
 private:
 
@@ -610,8 +563,8 @@ private:
 
         ID_PREDICTION_TOGGLE, ID_PREDICTION_STR_DEC, ID_PREDICTION_STR_INC,
         ID_CLICK_TOGGLE,
-        ID_INTERPOLATION_TOGGLE, ID_INTERP_MULT_DEC, ID_INTERP_MULT_INC,
 
+        ID_SMOOTHING_TOGGLE, ID_SMOOTHING_STR_DEC, ID_SMOOTHING_STR_INC,
 
         ID_VISUAL_AREA = 2000
     };
@@ -818,6 +771,30 @@ private:
             rightY += 35;
         }
 
+        CreateWindow(L"STATIC", L"Smoothing:", WS_VISIBLE | WS_CHILD,
+            rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
+        rightY += 25;
+        CreateWindow(L"STATIC", config.smoothingEnabled ? L"ON" : L"OFF",
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            rightCol + 20, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+        CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
+            rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_SMOOTHING_TOGGLE, nullptr, nullptr);
+        rightY += 30;
+
+        if (config.smoothingEnabled) {
+            CreateWindow(L"STATIC", L"Strength:", WS_VISIBLE | WS_CHILD,
+                rightCol + 10, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
+            rightY += 25;
+            CreateWindow(L"STATIC", std::to_wstring(config.smoothingStrength).c_str(),
+                WS_VISIBLE | WS_CHILD | SS_CENTER,
+                rightCol + 30, rightY, 40, 20, hwnd, nullptr, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
+                rightCol + 80, rightY, 25, 25, hwnd, (HMENU)ID_SMOOTHING_STR_DEC, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
+                rightCol + 110, rightY, 25, 25, hwnd, (HMENU)ID_SMOOTHING_STR_INC, nullptr, nullptr);
+            rightY += 35;
+        }
+
 
         CreateWindow(L"STATIC", L"Clicks:", WS_VISIBLE | WS_CHILD,
             rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
@@ -828,31 +805,6 @@ private:
         CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
             rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_CLICK_TOGGLE, nullptr, nullptr);
         rightY += 35;
-
-
-        CreateWindow(L"STATIC", L"Interpolation:", WS_VISIBLE | WS_CHILD,
-            rightCol, rightY, 120, 20, hwnd, nullptr, nullptr, nullptr);
-        rightY += 25;
-        CreateWindow(L"STATIC", interpolationEnabled ? L"ON" : L"OFF",
-            WS_VISIBLE | WS_CHILD | SS_CENTER,
-            rightCol + 20, rightY, 80, 20, hwnd, nullptr, nullptr, nullptr);
-        CreateWindow(L"BUTTON", L"Switch", WS_VISIBLE | WS_CHILD,
-            rightCol + 110, rightY, 60, 25, hwnd, (HMENU)ID_INTERPOLATION_TOGGLE, nullptr, nullptr);
-        rightY += 30;
-
-        if (interpolationEnabled) {
-            CreateWindow(L"STATIC", L"Multiplier:", WS_VISIBLE | WS_CHILD,
-                rightCol + 10, rightY, 70, 20, hwnd, nullptr, nullptr, nullptr);
-            rightY += 25;
-            CreateWindow(L"STATIC", (std::to_wstring(interpolationMultiplier) + L"x").c_str(),
-                WS_VISIBLE | WS_CHILD | SS_CENTER,
-                rightCol + 30, rightY, 40, 20, hwnd, nullptr, nullptr, nullptr);
-            CreateWindow(L"BUTTON", L"-", WS_VISIBLE | WS_CHILD,
-                rightCol + 80, rightY, 25, 25, hwnd, (HMENU)ID_INTERP_MULT_DEC, nullptr, nullptr);
-            CreateWindow(L"BUTTON", L"+", WS_VISIBLE | WS_CHILD,
-                rightCol + 110, rightY, 25, 25, hwnd, (HMENU)ID_INTERP_MULT_INC, nullptr, nullptr);
-            rightY += 35;
-        }
     }
 
     std::wstring GetRotationText() {
@@ -993,6 +945,45 @@ private:
         return velocityHistory.CalculateWeightedAverage();
     }
 
+    Vec2i ApplyRawDataSmoothing(const Vec2i& newRawPos, bool inProximity, bool isTouching) {
+        if (!config.smoothingEnabled) {
+            return newRawPos;
+        }
+
+        if (!inProximity && !isTouching) {
+            hasSmoothedData.store(false);
+            return newRawPos;
+        }
+
+        if (!hasSmoothedData.load()) {
+            smoothedRawPos.store(newRawPos);
+            hasSmoothedData.store(true);
+            return newRawPos;
+        }
+
+        Vec2i currentSmoothed = smoothedRawPos.load();
+
+        float deltaX = (float)(newRawPos.x - currentSmoothed.x);
+        float deltaY = (float)(newRawPos.y - currentSmoothed.y);
+        float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
+
+        if (distance < SMOOTHING_THRESHOLD_BASE) {
+            return currentSmoothed;
+        }
+
+        float smoothingFactor = 1.0f - (config.smoothingStrength * 0.04f);
+        smoothingFactor = max(0.1f, min(0.98f, smoothingFactor));
+
+        Vec2i result;
+        result.x = (int)(currentSmoothed.x + (deltaX * smoothingFactor));
+        result.y = (int)(currentSmoothed.y + (deltaY * smoothingFactor));
+
+        result.x = max(0, min(currentTablet.maxX, result.x));
+        result.y = max(0, min(currentTablet.maxY, result.y));
+
+        smoothedRawPos.store(result);
+        return result;
+    }
     void HandleCommand(int commandId) {
         switch (commandId) {
 
@@ -1001,12 +992,10 @@ private:
         case ID_CENTER_LEFT: MoveAreaCenter(-1, 0); break;
         case ID_CENTER_RIGHT: MoveAreaCenter(1, 0); break;
 
-
         case ID_AREA_WIDTH_DEC: AdjustAreaSize(-1, 0); break;
         case ID_AREA_WIDTH_INC: AdjustAreaSize(1, 0); break;
         case ID_AREA_HEIGHT_DEC: AdjustAreaSize(0, -1); break;
         case ID_AREA_HEIGHT_INC: AdjustAreaSize(0, 1); break;
-
 
         case ID_ROTATION_TOGGLE: ConfigureRotation(); break;
         case ID_MONITOR_SWITCH: SwitchMonitor(); break;
@@ -1015,14 +1004,14 @@ private:
             else Start();
             break;
 
-
         case ID_PREDICTION_TOGGLE: TogglePrediction(); break;
         case ID_PREDICTION_STR_DEC: AdjustPredictionStrength(-1); break;
         case ID_PREDICTION_STR_INC: AdjustPredictionStrength(1); break;
         case ID_CLICK_TOGGLE: ToggleClick(); break;
-        case ID_INTERPOLATION_TOGGLE: ToggleInterpolation(); break;
-        case ID_INTERP_MULT_DEC: AdjustInterpolationMultiplier(-1); break;
-        case ID_INTERP_MULT_INC: AdjustInterpolationMultiplier(1); break;
+
+        case ID_SMOOTHING_TOGGLE: ToggleSmoothing(); break;
+        case ID_SMOOTHING_STR_DEC: AdjustSmoothingStrength(-1); break;
+        case ID_SMOOTHING_STR_INC: AdjustSmoothingStrength(1); break;
         }
 
         UpdateGUI();
@@ -1058,10 +1047,6 @@ private:
     }
 
 private:
-    static const int ADVANCED_INTERPOLATION_BUFFER_SIZE = 32;
-    std::atomic<int> advancedInterpolationWriteIndex{ 0 };
-    std::atomic<int> advancedInterpolationSampleCount{ 0 };
-
     bool hasSSE, hasSSE2, hasAVX;
 
     HANDLE consoleHandle;
@@ -1278,6 +1263,10 @@ public:
         memset(workingPositions, 0, sizeof(workingPositions));
         memset(workingWeights, 0, sizeof(workingWeights));
         memset(workingTimestamps, 0, sizeof(workingTimestamps));
+
+        Vec2i zeroSmoothed(0, 0);
+        smoothedRawPos.store(zeroSmoothed);
+        hasSmoothedData.store(false);
     }
 
     void InitializeTabletLookupTable() {
@@ -1392,8 +1381,8 @@ public:
                     else if (key == "predictionStrength") config.predictionStrength = std::stoi(value);
                     else if (key == "clickEnabled") config.clickEnabled = (value == "1");
                     else if (key == "currentMonitor") config.currentMonitor = std::stoi(value);
-                    else if (key == "interpolationEnabled") interpolationEnabled = (value == "1");
-                    else if (key == "interpolationMultiplier") interpolationMultiplier = std::stoi(value);
+                    else if (key == "smoothingEnabled") config.smoothingEnabled = (value == "1");
+                    else if (key == "smoothingStrength") config.smoothingStrength = std::stoi(value);
                 }
             }
             file.close();
@@ -1412,8 +1401,8 @@ public:
             file << "predictionStrength = " << config.predictionStrength << std::endl;
             file << "clickEnabled = " << (config.clickEnabled ? 1 : 0) << std::endl;
             file << "currentMonitor = " << config.currentMonitor << std::endl;
-            file << "interpolationEnabled = " << (interpolationEnabled ? 1 : 0) << std::endl;
-            file << "interpolationMultiplier = " << interpolationMultiplier << std::endl;
+            file << "smoothingEnabled = " << (config.smoothingEnabled ? 1 : 0) << std::endl;
+            file << "smoothingStrength = " << config.smoothingStrength << std::endl;
             file.close();
         }
     }
@@ -1634,6 +1623,19 @@ public:
         SaveConfig();
     }
 
+    void ToggleSmoothing() {
+        config.smoothingEnabled = !config.smoothingEnabled;
+        if (!config.smoothingEnabled) {
+            hasSmoothedData.store(false);
+        }
+        SaveConfig();
+    }
+
+    void AdjustSmoothingStrength(int delta) {
+        config.smoothingStrength = max(1, min(20, config.smoothingStrength + delta));
+        SaveConfig();
+    }
+
     void ToggleClick() {
         config.clickEnabled = !config.clickEnabled;
         SaveConfig();
@@ -1681,7 +1683,7 @@ public:
 
         mainWindow = CreateWindow(
             L"UltraTabletDriverGUI",
-            L"Ultra Tablet Driver v4.0 - GUI",
+            L"Ultra Tablet Driver v4.1 - GUI",
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
             CW_USEDEFAULT, CW_USEDEFAULT, 520, 650,
             nullptr, nullptr, GetModuleHandle(nullptr), this
@@ -1724,7 +1726,11 @@ public:
         Vec2i zeroPos(-1, -1);
         lastValidRawPos.store(zeroPos);
 
-        ClearInterpolationBuffer();
+        hasSmoothedData.store(false);
+        Vec2i zeroSmoothed(0, 0);
+        smoothedRawPos.store(zeroSmoothed);
+
+        velocityHistory.Clear();
 
         inputThread = std::thread(&HighPerformanceTabletDriver::SafeInputLoop, this);
         processingThread = std::thread(&HighPerformanceTabletDriver::SafeProcessingLoop, this);
@@ -1793,12 +1799,7 @@ private:
                         if (CalculateScreenPosition(localData, baseScreenPos)) {
                             ApplyPrediction(baseScreenPos, finalScreenPos, localData.timestamp);
 
-                            if (interpolationEnabled && hasLastPosition.load()) {
-                                ProcessInterpolatedMovement(finalScreenPos);
-                            }
-                            else {
-                                MoveCursorToPosition(finalScreenPos);
-                            }
+                            MoveCursorToPosition(finalScreenPos);
 
                             HandleMouseClick(localData.isTouching);
                         }
@@ -1815,12 +1816,7 @@ private:
                         if (CalculateScreenPosition(localData, baseScreenPos)) {
                             ApplyPrediction(baseScreenPos, finalScreenPos, localData.timestamp);
 
-                            if (interpolationEnabled && hasLastPosition.load()) {
-                                ProcessInterpolatedMovement(finalScreenPos);
-                            }
-                            else {
-                                MoveCursorToPosition(finalScreenPos);
-                            }
+                            MoveCursorToPosition(finalScreenPos);
 
                             HandleMouseClick(localData.isTouching);
                         }
@@ -1839,30 +1835,6 @@ private:
             }
         }
     }
-
-    void ProcessInterpolatedMovement(const Vec2f& finalScreenPos) {
-        Vec2f currentVel = currentVelocity.load();
-
-        InterpolationSample sample;
-        sample.screenPos = finalScreenPos;
-        sample.timestamp = std::chrono::high_resolution_clock::now();
-        sample.valid = true;
-
-        interpolationRingBuffer.TryPush(sample);
-
-
-        MoveCursorToPosition(finalScreenPos);
-
-
-        if (hasLastPosition.load()) {
-            std::vector<Vec2f> interpolatedPositions = GenerateOptimizedInterpolatedPositions();
-
-            for (const auto& pos : interpolatedPositions) {
-                MoveCursorToPosition(pos);
-            }
-        }
-    }
-
     void OptimizeSystemForTablet() {
 
         timeBeginPeriod(1);
@@ -1878,43 +1850,6 @@ private:
 
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
             &PowerThrottling, sizeof(PowerThrottling));
-    }
-
-    std::vector<Vec2f> GenerateOptimizedInterpolatedPositions() {
-        std::vector<Vec2f> positions;
-        positions.reserve(interpolationMultiplier);
-
-        if (interpolationRingBuffer.Size() < 2) {
-            return positions;
-        }
-
-        Vec2f lastPos = lastScreenPos.load();
-        lastPos.Prefetch();
-
-        if (hasLastPosition.load()) {
-            Vec2f currentPos = fastAccessData.isValid ?
-                Vec2f((float)currentScreenX.load(), (float)currentScreenY.load()) : lastPos;
-
-            currentPos.Prefetch();
-
-
-            __m128 vlastPos = _mm_set_ps(0.0f, 0.0f, lastPos.y, lastPos.x);
-            __m128 vcurrentPos = _mm_set_ps(0.0f, 0.0f, currentPos.y, currentPos.x);
-            __m128 vdelta = _mm_sub_ps(vcurrentPos, vlastPos);
-
-            for (int i = 1; i < interpolationMultiplier; i++) {
-                float t = (float)i / interpolationMultiplier;
-                __m128 vt = _mm_set1_ps(t);
-                __m128 vinterp = _mm_add_ps(vlastPos, _mm_mul_ps(vdelta, vt));
-
-                float interpData[4];
-                _mm_store_ps(interpData, vinterp);
-
-                positions.emplace_back(interpData[0], interpData[1]);
-            }
-        }
-
-        return positions;
     }
 
     bool CalculateScreenPosition(const TabletData& data, Vec2f& screenPos) {
@@ -2069,6 +2004,10 @@ private:
             int deltaX = screenX - currentPos.x;
             int deltaY = screenY - currentPos.y;
 
+            if (abs(deltaX) < 1 && abs(deltaY) < 1) {
+                return;
+            }
+
             INPUT input = {};
             input.type = INPUT_MOUSE;
             input.mi.dwFlags = MOUSEEVENTF_MOVE;
@@ -2081,26 +2020,6 @@ private:
         }
         catch (...) {
         }
-    }
-
-    void ToggleInterpolation() {
-        interpolationEnabled = !interpolationEnabled;
-
-        if (!interpolationEnabled) {
-            ClearInterpolationBuffer();
-        }
-
-        SaveConfig();
-    }
-
-    void AdjustInterpolationMultiplier(int delta) {
-        interpolationMultiplier = max(1, min(25, interpolationMultiplier + delta));
-        SaveConfig();
-    }
-
-    void ClearInterpolationBuffer() {
-
-        interpolationRingBuffer = LockFreeRingBuffer<InterpolationSample, INTERP_BUFFER_SIZE>();
     }
 
     void ProcessRawTabletData(BYTE* buffer, DWORD length) {
@@ -2129,8 +2048,12 @@ private:
                 return;
             }
 
-            localData.rawPos = Vec2i(rawX, rawY);
-            localData.rawPos.Prefetch();
+            Vec2i originalRawPos(rawX, rawY);
+            originalRawPos.Prefetch();
+
+            Vec2i smoothedPos = ApplyRawDataSmoothing(originalRawPos, localData.inProximity, localData.isTouching);
+
+            localData.rawPos = smoothedPos;
 
         }
         catch (...) {
@@ -2144,14 +2067,11 @@ private:
         localData.isValid = true;
 
         if (localData.inProximity || localData.isTouching) {
-
             fastAccessData = localData;
             _mm_sfence();
             fastDataValid = true;
 
-
             if (!batchBuffer.TryPush(localData)) {
-
                 ProcessBatchedReports();
                 tabletDataBuffer.TryPush(localData);
             }
@@ -2412,12 +2332,11 @@ public:
 };
 
 HighPerformancePool<TabletData, 128> HighPerformanceTabletDriver::tabletPool;
-HighPerformancePool<InterpolationSample, 256> HighPerformanceTabletDriver::interpolationPool;
 
 
 int main() {
-    std::cout << "Ultra Tablet Driver v4.0 (stable) - by vilounos" << std::endl;
-    std::cout << "Added SIMD Acceleration" << std::endl;
+    std::cout << "Ultra Tablet Driver v4.1 (stable) - by vilounos" << std::endl;
+    std::cout << "Removed Interpolation, added Smoothing" << std::endl;
     std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G640" << std::endl << std::endl;
 
     if (!SIMDMath::HasSSE2()) {
