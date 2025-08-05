@@ -2382,7 +2382,7 @@ void HighPerformanceTabletDriver::RunConfiguration() {
         L"UltraTabletDriverGUI",
         L"Ultra Tablet Driver v4.2 - Optimized Edition",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1000, 500,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1000, 600,
         nullptr, nullptr, GetModuleHandle(nullptr), this
     );
 
