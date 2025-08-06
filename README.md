@@ -3,6 +3,8 @@ This is really good tablet driver mostly for playing Osu!
 
 It is in C++... That means it is extremly fast and low latency - Faster than OpenTabletDriver
 
+If you have any issues, questions or want to add support for your tablet or anything else, you can add me and contact me on Discord: vilounos
+
 ## Support:
 - A huge thank you to an Osu! streamer Rumpowl who is helping me with testing and ideas: twitch.tv/rumpowl
 
@@ -10,18 +12,19 @@ It is in C++... That means it is extremly fast and low latency - Faster than Ope
 - Prediction: Predicts where you most likely want to move your cursor (might add snaps, configruable)
 - Smoothing: Makes your cursor move smoother (It increases latency when higher smoothing, configurable)
 - Jitter reducer (If the movement is below a given threshold it will prevent the cursor from moving. configurable)
+- Advanced logging/monitoring system
 - Custom tablet area (size, location, rotation)
 - Monitor switching
-- Simple GUI
-
+- Simple GUI (still some visual bugs)
 
 ## Current known issues:
 - The Height and Width are not swapping when rotating the area
+- GUI blinking
 
 ## Supported tablets:
-- Wacom CTL-672 (One By Wacom Medium) - the only tested and 100% working tablet
-- Wacom CTL-472 (One By Wacom Small)
-- XP Pen Star G640
+- Wacom CTL-672 (One By Wacom Medium) - tested
+- Wacom CTL-472 (One By Wacom Small) - tested
+- XP Pen Star G640 - not tested but should work
 
 ## Minimum requirements:
 - CPU with at least 4 threads recommended - The driver is CPU based + uses multithreadning
