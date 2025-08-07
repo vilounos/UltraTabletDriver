@@ -26,6 +26,8 @@ If you have any issues, questions or want to add support for your tablet or anyt
 - Wacom CTL-472 (One By Wacom Small) - tested
 - XP Pen Star G640 - not tested but should work
 
+-  If you want to add support for your tablet, follow instruction in this repository: [GetRawData](https://github.com/vilounos/getrawdata-tablet)
+
 ## Minimum requirements:
 - CPU with at least 4 threads recommended - The driver is CPU based + uses multithreadning
 - Windows 10/11 - tested on 11 only
@@ -34,15 +36,15 @@ If you have any issues, questions or want to add support for your tablet or anyt
 Note: It might not run well on bad hardware.
 
 ## How to run:
-Download the latest UltraTabletDriver.exe file from Releases.
+Download the latest [UltraTabletDriver.exe](https://github.com/vilounos/UltraTabletDriver/releases) file from Releases.
 
-Download OpenTabletDriver and run it as administrator.
+Download [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver) and run it as administrator.
 
-Close OpenTabletDriver (make sure to close it in system tray too)
+Close [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver) (make sure to close it in system tray too)
 
-Connect your tablet to PC and run UltraTabletDriver.exe as Administrator
+Connect your tablet to PC and run [UltraTabletDriver.exe](https://github.com/vilounos/UltraTabletDriver/releases) as Administrator
 
 Every time you connect/reconnect your tablet to PC, you have to repeat these steps else the driver won't work
 
 ## Common issues:
-- The tablet is not detected by the program - Try closing/terminating every other driver... If it still doesn't work, try running OpenTabletDriver as Administrator and than close it and try again (UltraTabletDriver in current state can't bypass default Windows tablet driver)
+- The tablet is not detected by the program - Try closing/terminating every other driver... If it still doesn't work, try running [OpenTabletDriver](https://github.com/OpenTabletDriver/OpenTabletDriver) as Administrator and than close it and try again ([UltraTabletDriver](https://github.com/vilounos/UltraTabletDriver/releases) in current state can't bypass default Windows tablet driver)
