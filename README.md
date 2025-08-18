@@ -18,6 +18,7 @@ If you have any issues, questions or want to add support for your tablet or anyt
 - Simple GUI (still some visual bugs)
 
 ## Current known issues:
+- On some devices while running the driver there might be a problem with your audio output (mostly on some laptops the in build speaker just won't work)
 - The Height and Width are not swapping when rotating the area
 - GUI blinking
 
