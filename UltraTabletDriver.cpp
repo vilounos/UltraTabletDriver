@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <iostream>
@@ -233,7 +233,8 @@ enum class TabletType {
     UNKNOWN = 0,
     WACOM_CTL672 = 1,
     XPPEN_STAR_G640 = 2,
-    WACOM_CTL472 = 3
+    WACOM_CTL472 = 3,
+    WACOM_PTH660 = 4
 };
 struct TabletSpec {
     int maxX;
@@ -534,12 +535,14 @@ private:
         std::deque<LatencySample> inputLatencyWindow;
         std::deque<LatencySample> processingLatencyWindow;
     } performanceStats;
-    const TabletSpec TABLET_SPECS[4] = {
+    const TabletSpec TABLET_SPECS[5] = {
         {0, 0, 0, 0, TabletType::UNKNOWN, "Unknown"},
         {21610, 13498, 216, 135, TabletType::WACOM_CTL672, "Wacom CTL-672"},
         {30480, 20320, 152, 102, TabletType::XPPEN_STAR_G640, "XPPen Star G 640"},
-        {15200, 9500, 152, 95, TabletType::WACOM_CTL472, "Wacom CTL-472"}
+        {15200, 9500, 152, 95, TabletType::WACOM_CTL472, "Wacom CTL-472"},
+        {43200, 27600, 224, 148, TabletType::WACOM_PTH660, "Wacom PTH-660" }
     };
+
     FORCE_INLINE bool ParseWacomCTL672(BYTE* data, DWORD length, TabletData& output) {
         if (length < 8) return false;
         int rawX, rawY;
@@ -597,6 +600,30 @@ private:
         output.isTouching = isTouching;
         output.timestamp = std::chrono::high_resolution_clock::now();
         output.isValid = IsValidTabletDataFast(output.rawPos, inProximity);
+        return output.isValid;
+    }
+    FORCE_INLINE bool ParseWacomPTH660(BYTE* data, DWORD length, TabletData& output)
+    {
+        if (length < 10 || data[0] != 0x10)
+        {
+            return false;
+        }
+
+        int rawX = data[2] | (data[3] << 8);
+        int rawY = data[5] | (data[6] << 8);
+        int pressure = data[8] | (data[9] << 8); 
+
+        if (rawX == 0xFFFF || rawY == 0xFFFF)
+        {
+            return false;
+        }
+
+        output.rawPos = Vec2i(rawX, rawY);
+        output.inProximity = (data[1] & 0x20) != 0;
+        output.isTouching = (data[1] & 0x01) != 0 && pressure > 0;
+        output.timestamp = std::chrono::high_resolution_clock::now();
+        output.isValid = IsValidTabletDataFast(output.rawPos, output.inProximity);
+
         return output.isValid;
     }
     FORCE_INLINE bool ParseXPPen(BYTE* data, DWORD length, TabletData& output) {
@@ -690,6 +717,9 @@ private:
             break;
         case TabletType::WACOM_CTL472:
             tabletParser = &HighPerformanceTabletDriver::ParseWacomCTL472;
+            break;
+        case TabletType::WACOM_PTH660:
+            tabletParser = &HighPerformanceTabletDriver::ParseWacomPTH660;
             break;
         case TabletType::XPPEN_STAR_G640:
             tabletParser = &HighPerformanceTabletDriver::ParseXPPen;
@@ -824,10 +854,12 @@ private:
         std::cout << "\nDetected Wacom tablet. Please select your specific model:" << std::endl;
         std::cout << "1. Wacom CTL-672 (One by Wacom Medium)" << std::endl;
         std::cout << "2. Wacom CTL-472 (One by Wacom Small)" << std::endl;
-        std::cout << "Enter your choice (1-2): ";
+        std::cout << "3. Wacom PTH-660 (Wacom Intuous Pro Medium)" << std::endl;
+
+        std::cout << "Enter your choice (1-3): ";
         int choice;
-        while (!(std::cin >> choice) || choice < 1 || choice > 2) {
-            std::cout << "Invalid input. Please enter 1 or 2: ";
+        while (!(std::cin >> choice) || choice < 1 || choice > 3) {
+            std::cout << "Invalid input. Please enter 1, 2 or 3: ";
             std::cin.clear();
             std::cin.ignore(10000, '\n');
         }
@@ -836,6 +868,8 @@ private:
             return TabletType::WACOM_CTL672;
         case 2:
             return TabletType::WACOM_CTL472;
+        case 3:
+            return TabletType::WACOM_PTH660;
         default:
             return TabletType::WACOM_CTL672;
         }
@@ -851,6 +885,12 @@ private:
         case TabletType::WACOM_CTL472:
             config.areaWidth = 40;
             config.areaHeight = 25;
+            config.areaCenterX = currentTablet.widthMM / 2;
+            config.areaCenterY = currentTablet.heightMM / 2;
+            break;
+               case TabletType::WACOM_PTH660:
+            config.areaWidth = currentTablet.widthMM;
+            config.areaHeight = currentTablet.heightMM;
             config.areaCenterX = currentTablet.widthMM / 2;
             config.areaCenterY = currentTablet.heightMM / 2;
             break;
@@ -2118,7 +2158,7 @@ void HighPerformanceTabletDriver::TogglePerformanceMonitor() {
 int main() {
     std::cout << "Ultra Tablet Driver v4.3 - Stable" << std::endl;
     std::cout << "Optimizations, Logging" << std::endl;
-    std::cout << "Support for Wacom CTL-672, CTL-472 & XPPen Star G640" << std::endl << std::endl;
+    std::cout << "Support for Wacom CTL-672, CTL-472, PTH-660 & XPPen Star G640" << std::endl << std::endl;
     timeBeginPeriod(1);
     HighPerformanceTabletDriver driver;
     if (!driver.Initialize()) {
@@ -2126,6 +2166,7 @@ int main() {
         std::cout << "Make sure your supported tablet is connected:" << std::endl;
         std::cout << "- Wacom CTL-672 (One by Wacom Medium)" << std::endl;
         std::cout << "- Wacom CTL-472 (One by Wacom Small)" << std::endl;
+        std::cout << "- Wacom PTH-660 (Wacom Intuos Pro Medium)" << std::endl;
         std::cout << "- XPPen Star G 640" << std::endl;
         std::cout << "Try running this driver as Administrator!" << std::endl;
         std::cout << "If your tablet is connected and all drivers are disabled:" << std::endl;
